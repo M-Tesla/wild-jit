@@ -1,0 +1,18 @@
+use lib.unison_base_7_20_0
+
+structural ability Ask where
+  ask : {Ask} Nat
+
+runAsk : Request {Ask} Nat -> Nat
+runAsk = cases
+  { Ask.ask -> k } -> handle k 2 with runAsk
+  { n } -> n
+
+main : '{IO, Exception} ()
+main = do
+  n = handle
+    x = 40
+    y = Ask.ask
+    x Nat.+ y
+  with runAsk
+  printLine (Nat.toText n)

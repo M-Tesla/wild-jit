@@ -1,0 +1,78 @@
+use lib.unison_base_7_20_0
+
+isDig c =
+  c Text.== "0" || c Text.== "1" || c Text.== "2" || c Text.== "3" || c Text.== "4" || c Text.== "5" || c Text.== "6" || c Text.== "7" || c Text.== "8" || c Text.== "9"
+
+isLow c =
+  c Text.== "a" || c Text.== "b" || c Text.== "c" || c Text.== "d" || c Text.== "e" || c Text.== "f" || c Text.== "g" || c Text.== "h" || c Text.== "i" || c Text.== "j" || c Text.== "k" || c Text.== "l" || c Text.== "m" || c Text.== "n" || c Text.== "o" || c Text.== "p" || c Text.== "q" || c Text.== "r" || c Text.== "s" || c Text.== "t" || c Text.== "u" || c Text.== "v" || c Text.== "w" || c Text.== "x" || c Text.== "y" || c Text.== "z"
+
+isUp c =
+  c Text.== "A" || c Text.== "B" || c Text.== "C" || c Text.== "D" || c Text.== "E" || c Text.== "F" || c Text.== "G" || c Text.== "H" || c Text.== "I" || c Text.== "J" || c Text.== "K" || c Text.== "L" || c Text.== "M" || c Text.== "N" || c Text.== "O" || c Text.== "P" || c Text.== "Q" || c Text.== "R" || c Text.== "S" || c Text.== "T" || c Text.== "U" || c Text.== "V" || c Text.== "W" || c Text.== "X" || c Text.== "Y" || c Text.== "Z"
+
+lower c =
+  if c Text.== "A" then "a"
+  else if c Text.== "B" then "b"
+  else if c Text.== "C" then "c"
+  else if c Text.== "D" then "d"
+  else if c Text.== "E" then "e"
+  else if c Text.== "F" then "f"
+  else if c Text.== "G" then "g"
+  else if c Text.== "H" then "h"
+  else if c Text.== "I" then "i"
+  else if c Text.== "J" then "j"
+  else if c Text.== "K" then "k"
+  else if c Text.== "L" then "l"
+  else if c Text.== "M" then "m"
+  else if c Text.== "N" then "n"
+  else if c Text.== "O" then "o"
+  else if c Text.== "P" then "p"
+  else if c Text.== "Q" then "q"
+  else if c Text.== "R" then "r"
+  else if c Text.== "S" then "s"
+  else if c Text.== "T" then "t"
+  else if c Text.== "U" then "u"
+  else if c Text.== "V" then "v"
+  else if c Text.== "W" then "w"
+  else if c Text.== "X" then "x"
+  else if c Text.== "Y" then "y"
+  else if c Text.== "Z" then "z"
+  else c
+
+isWord c = isDig c || isLow c || isUp c
+
+go : Nat -> Nat -> Text -> Text -> Nat -> Text
+go i n src acc gap =
+  if Nat.eq i n then acc
+  else
+    ch = Text.take 1 (Text.drop i src)
+    if isWord ch then
+      low = lower ch
+      piece = if Nat.eq gap 1 then "-" Text.++ low else low
+      go (i Nat.+ 1) n src (acc Text.++ piece) 0
+    else
+      gap2 = if Nat.eq (Text.size acc) 0 then 0 else 1
+      go (i Nat.+ 1) n src acc gap2
+
+slugify : Text -> Text
+slugify t = go 0 (Text.size t) t "" 0
+
+show : Text -> Text
+show t =
+  s = slugify t
+  if Nat.eq (Text.size s) 0 then "none" else s
+
+slugSum : Nat -> Nat -> Nat
+slugSum n acc =
+  if Nat.eq n 0 then acc
+  else
+    s = slugify "Hello, World!"
+    slugSum (n Nat.- 1) (acc Nat.+ Text.size s)
+
+slugMain : '{IO, Exception} ()
+slugMain = do
+  printLine "slug"
+  printLine (show "hello world")
+  printLine (show "HelloWorld")
+  printLine (show "--!@==)/()")
+  printLine (show "Hello, World!")
+  printLine (Nat.toText (slugSum 10000 0))

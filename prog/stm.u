@@ -1,0 +1,12 @@
+use lib.unison_base_7_20_0
+
+main : '{IO, Exception} ()
+main = do
+  v = TVar.newIO 0
+  printLine (Nat.toText (TVar.readIO v))
+  n = STM.atomically do
+    x = TVar.read v
+    TVar.write v (x Nat.+ 7)
+    TVar.read v
+  printLine (Nat.toText n)
+  printLine (Nat.toText (TVar.readIO v))

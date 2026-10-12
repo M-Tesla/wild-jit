@@ -1,0 +1,6 @@
+use lib.unison_base_7_20_0
+
+main : '{IO, Exception} ()
+main = do
+  Exception.raise (failure "boom" ())
+  printLine (Nat.toText 1)

@@ -1,0 +1,33 @@
+use lib.unison_base_7_20_0
+
+structural type Color = red | blue
+
+structural type Box = box Nat
+
+structural ability Ask where
+  ask : {Ask} Nat
+
+runAsk : Request {Ask} Nat -> Nat
+runAsk = cases
+  { Ask.ask -> k } -> handle k 2 with runAsk
+  { n } -> n
+
+fromColor : Color -> Nat
+fromColor c = match c with
+  red -> 1
+  blue -> 2
+
+fromBox : Box -> Nat
+fromBox b = match b with
+  box n -> n Nat.+ 1
+
+main : '{IO, Exception} ()
+main = do
+  n = handle
+    x = Ask.ask
+    c = if Nat.eq x 0 then red else blue
+    fromColor c
+  with runAsk
+  m = fromBox (box 7)
+  printLine (Nat.toText n)
+  printLine (Nat.toText m)

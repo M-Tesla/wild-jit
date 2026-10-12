@@ -1,0 +1,67 @@
+use lib.unison_base_7_20_0
+
+structural ability Choose where
+  choose : {Choose} Boolean
+
+structural ability State s where
+  get : {State s} s
+  put : s ->{State s} ()
+
+sinChoose : Request {Choose} Nat -> Nat
+sinChoose = cases
+  { Choose.choose -> k } ->
+    left = handle k true with sinChoose
+    right = handle k false with sinChoose
+    left Nat.+ right
+  { n } -> n
+
+sinState : Nat -> Request {State Nat} Nat -> Nat
+sinState s = cases
+  { State.get -> k } -> handle k s with sinState s
+  { State.put s2 -> k } -> handle k () with sinState s2
+  { a } -> a
+
+soutChoose : Request {Choose} Nat -> Nat
+soutChoose = cases
+  { Choose.choose -> k } ->
+    left = handle k true with soutChoose
+    right = handle k false with soutChoose
+    left Nat.+ right
+  { n } -> n
+
+soutState : Nat -> Request {State Nat} Nat -> Nat
+soutState s = cases
+  { State.get -> k } -> handle k s with soutState s
+  { State.put s2 -> k } -> handle k () with soutState s2
+  { a } -> a
+
+sinMain : '{IO, Exception} ()
+sinMain = do
+  n = handle
+    handle
+      b = Choose.choose
+      if b then
+        State.put 9
+        1
+      else State.get
+    with sinState 0
+  with sinChoose
+  printLine (Nat.toText n)
+
+soutMain : '{IO, Exception} ()
+soutMain = do
+  n = handle
+    handle
+      b = Choose.choose
+      if b then
+        State.put 9
+        1
+      else State.get
+    with soutChoose
+  with soutState 0
+  printLine (Nat.toText n)
+
+main : '{IO, Exception} ()
+main = do
+  !sinMain
+  !soutMain

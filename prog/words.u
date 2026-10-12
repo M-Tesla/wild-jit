@@ -1,0 +1,8 @@
+use lib.unison_base_7_20_0
+
+main : '{IO, Exception} ()
+main = do
+  printLine ("ab" Text.++ "c")
+  t = Nat.toText 7
+  printLine (t Text.++ "x")
+  printLine (Nat.toText 5000050000)

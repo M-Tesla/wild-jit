@@ -1,0 +1,21 @@
+use lib.unison_base_7_20_0
+
+structural ability Choose where
+  choose : {Choose} Boolean
+
+runChoose : Request {Choose} Nat -> Nat
+runChoose = cases
+  { Choose.choose -> k } ->
+    left = handle k true with runChoose
+    right = handle k false with runChoose
+    left Nat.+ right
+  { n } -> n
+
+main : '{IO, Exception} ()
+main = do
+  n = handle
+    x = 5
+    b = Choose.choose
+    if b then x else x Nat.+ 1
+  with runChoose
+  printLine (Nat.toText n)

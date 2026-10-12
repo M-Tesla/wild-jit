@@ -1,0 +1,78 @@
+use lib.unison_base_7_20_0
+
+cellBase : Nat
+cellBase = 16
+
+at : Text -> Nat -> Text
+at s i = Text.take 1 (Text.drop i s)
+
+min2 : Nat -> Nat -> Nat
+min2 a b = if a Nat.< b then a else b
+
+min3 : Nat -> Nat -> Nat -> Nat
+min3 a b c = min2 a (min2 b c)
+
+initRow : Nat -> Nat -> Nat -> Nat
+initRow j n place =
+  if Nat.eq j n then 0
+  else (j Nat.* place) Nat.+ initRow (j Nat.+ 1) n (place Nat.* cellBase)
+
+cols : Nat -> Nat -> Nat -> Nat -> Nat -> Text -> Text -> Nat -> Nat
+cols j len2 prev last place char1 text2 acc =
+  if Nat.eq j len2 then acc
+  else
+    prevDiag = Nat.mod prev cellBase
+    rest = Nat.div prev cellBase
+    prevUp = Nat.mod rest cellBase
+    char2 = at text2 j
+    subCost = if char1 Text.== char2 then prevDiag else prevDiag Nat.+ 1
+    deleteCost = prevUp Nat.+ 1
+    insertCost = last Nat.+ 1
+    nextCost = min3 deleteCost insertCost subCost
+    cols (j Nat.+ 1) len2 rest nextCost (place Nat.* cellBase) char1 text2 (acc Nat.+ (nextCost Nat.* place))
+
+rows : Nat -> Nat -> Nat -> Nat -> Text -> Text -> Nat
+rows i len1 len2 prev text1 text2 =
+  if Nat.eq i len1 then prev
+  else
+    char1 = at text1 i
+    start = i Nat.+ 1
+    built = cols 0 len2 prev start cellBase char1 text2 start
+    rows (i Nat.+ 1) len1 len2 built text1 text2
+
+lastCell : Nat -> Nat -> Nat
+lastCell row n = Nat.mod (Nat.div row (pow cellBase n)) cellBase
+
+pow : Nat -> Nat -> Nat
+pow b e =
+  if Nat.eq e 0 then 1
+  else b Nat.* pow b (Nat.drop e 1)
+
+goDist : Nat -> Nat -> Text -> Text -> Nat
+goDist n1 n2 a b =
+  if Nat.eq n1 0 then n2
+  else goDist2 n1 n2 a b
+
+goDist2 : Nat -> Nat -> Text -> Text -> Nat
+goDist2 n1 n2 a b =
+  if Nat.eq n2 0 then n1
+  else
+    prev = initRow 0 (n2 Nat.+ 1) 1
+    lastCell (rows 0 n1 n2 prev a b) n2
+
+distance : Text -> Text -> Nat
+distance a b = goDist (Text.size a) (Text.size b) a b
+
+fzSum : Nat -> Nat -> Nat
+fzSum n acc =
+  if Nat.eq n 0 then acc
+  else
+    d = distance "kitten" "sitting"
+    fzSum (n Nat.- 1) (acc Nat.+ d)
+
+fzMain : '{IO, Exception} ()
+fzMain = do
+  printLine "fuzzy"
+  printLine (Nat.toText (distance "kitten" "sitting"))
+  printLine (Nat.toText (distance "test" "tests"))
+  printLine (Nat.toText (fzSum 10000 0))

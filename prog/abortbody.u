@@ -1,0 +1,14 @@
+use lib.unison_base_7_20_0
+
+structural ability Abort where
+  abort : {Abort} Nat
+
+runAbort : Request {Abort} Nat -> Nat
+runAbort = cases
+  { Abort.abort -> k } -> 0
+  { n } -> n
+
+abortBody : '{Abort} Nat
+abortBody = do
+  x = Abort.abort
+  x Nat.+ 1

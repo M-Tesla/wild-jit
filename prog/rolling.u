@@ -1,0 +1,83 @@
+use lib.unison_base_7_20_0
+
+structural type RollingHash h = RollingHash h (h -> RollingHash h) (h -> RollingHash h)
+
+prime30 : Nat
+prime30 = 1073741789
+
+modExp : Nat -> Nat -> Nat -> Nat
+modExp base exponent m =
+  if Nat.eq m 1 then 0
+  else modGo (Nat.mod base m) exponent 1 m
+
+modGo : Nat -> Nat -> Nat -> Nat -> Nat
+modGo b e acc m =
+  if Nat.eq e 0 then acc
+  else
+    b2 = Nat.mod (b Nat.* b) m
+    e2 = Nat.div e 2
+    acc2 = if Nat.eq (Nat.mod e 2) 0 then acc else Nat.mod (b Nat.* acc) m
+    modGo b2 e2 acc2 m
+
+rabinKarp : Nat -> Nat -> Nat -> RollingHash Nat
+rabinKarp a m hash0 =
+  use Nat * + mod
+  dequeue hash cacheWindowSize cache windowSize char =
+    use Nat - ==
+    windowSize2 = windowSize - 1
+    c0h =
+      if windowSize2 == cacheWindowSize then cache
+      else modExp a windowSize2 m
+    hash2 = mod (hash + m - mod (char * c0h) m) m
+    RollingHash
+      hash2
+      (enqueue hash2 windowSize2 c0h windowSize2)
+      (dequeue hash2 windowSize2 c0h windowSize2)
+  enqueue hash cacheWindowSize cache windowSize char =
+    hash2 = mod (hash * a + char) m
+    windowSize2 = windowSize + 1
+    RollingHash
+      hash2
+      (enqueue hash2 cacheWindowSize cache windowSize2)
+      (dequeue hash2 cacheWindowSize cache windowSize2)
+  RollingHash
+    hash0
+    (enqueue hash0 Nat.maxNat 0 0)
+    (dequeue hash0 Nat.maxNat 0 0)
+
+empty : RollingHash Nat
+empty = rabinKarp 53 prime30 (Nat.mod 0 prime30)
+
+hash : RollingHash h -> h
+hash = cases
+  RollingHash h _ _ -> h
+
+enqueue : h -> RollingHash h -> RollingHash h
+enqueue h = cases
+  RollingHash _ enq _ -> enq h
+
+dequeue : h -> RollingHash h -> RollingHash h
+dequeue h = cases
+  RollingHash _ _ deq -> deq h
+
+enqueue3 : Nat -> Nat -> Nat -> RollingHash Nat -> RollingHash Nat
+enqueue3 x y z rh = enqueue z (enqueue y (enqueue x rh))
+
+enqueue2 : Nat -> Nat -> RollingHash Nat -> RollingHash Nat
+enqueue2 y z rh = enqueue z (enqueue y rh)
+
+rhSum : Nat -> Nat -> Nat
+rhSum n acc =
+  if Nat.eq n 0 then acc
+  else
+    r1 = hash (dequeue 10 (enqueue3 10 11 12 empty))
+    rhSum (n Nat.- 1) (acc Nat.+ r1)
+
+rhMain : '{IO, Exception} ()
+rhMain = do
+  printLine "rolling"
+  r1 = hash (dequeue 10 (enqueue3 10 11 12 empty))
+  r2 = hash (enqueue2 11 12 empty)
+  printLine (Nat.toText r1)
+  printLine (Nat.toText r2)
+  printLine (Nat.toText (rhSum 10000 0))

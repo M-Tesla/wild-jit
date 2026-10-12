@@ -1,0 +1,9 @@
+use lib.unison_base_7_20_0
+
+main : '{IO, Exception} ()
+main = do
+  v = TVar.newIO 4
+  n = STM.atomically do
+    x = TVar.read v
+    if Nat.eq x 0 then STM.retry() else x
+  printLine (Nat.toText n)

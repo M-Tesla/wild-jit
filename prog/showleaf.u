@@ -1,0 +1,10 @@
+use lib.unison_base_7_20_0
+
+showLeaf : '{IO, Exception} ()
+showLeaf = do
+  printLine (cname "#ab")
+  printLine (cname "ab")
+  printLine (Nat.toText (tagNat "12"))
+  printLine (Nat.toText (tagNat "no"))
+  printLine (unquote "\"ab\"")
+  printLine (stripR "hi\r")

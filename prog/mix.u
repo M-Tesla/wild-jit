@@ -1,0 +1,46 @@
+use lib.unison_base_7_20_0
+
+main : '{IO, Exception} ()
+main = do
+  (z, zv) = handle bump 0 with stateHandler 0
+  printLine (Nat.toText z)
+  printLine (Nat.toText zv)
+  (st, value) = handle bump 4 with stateHandler 0
+  printLine (Nat.toText st)
+  printLine (Nat.toText value)
+  n = handle
+    (s, v) = handle
+      b = Choose.choose
+      if b then
+        State.put 9
+        1
+      else State.get
+    with stateHandler 0
+    printLine (Nat.toText s)
+    printLine (Nat.toText v)
+    v
+  with runChoose
+  printLine (Nat.toText n)
+  p = handle
+    printLine (Nat.toText 2)
+    b2 = Choose.choose
+    if b2 then
+      printLine (Nat.toText 3)
+      10
+    else
+      printLine (Nat.toText 4)
+      1
+  with runChoose
+  printLine (Nat.toText p)
+  q = handle
+    x = Ask.ask
+    c = if Nat.eq x 0 then red else blue
+    fromColor c
+  with runAsk
+  printLine (Nat.toText q)
+  printLine (Nat.toText (fromBox (box 7)))
+  a = handle
+    y = Abort.abort
+    y Nat.+ 1
+  with runAbort
+  printLine (Nat.toText a)

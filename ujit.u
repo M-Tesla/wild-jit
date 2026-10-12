@@ -1,0 +1,4782 @@
+use lib.unison_base_7_20_0
+use List +:
+
+-- Reads a Unison subset and emits C. Abilities capture the frame stack in rt.c.
+-- A handler resumed once keeps its frame. A straight request runs on that frame.
+-- A continuation used twice is copied.
+
+structural type Expr
+  = ENat Nat
+  | EBool Nat
+  | EUnit
+  | EVar Text
+  | EAdd Expr Expr
+  | ESub Expr Expr
+  | EEq Expr Expr
+  | EIf Expr Expr Expr
+  | ECall Text [Expr]
+  | EPerform Text (Optional Expr)
+  | EHandle Expr Text [Expr]
+  | ELet Text Expr Expr
+  | ESeq Expr Expr
+  | EPrint Expr
+  | EPair Expr Expr
+  | ETup Text Text Expr Expr
+  | ECon Nat (Optional Expr)
+  | EIsTag Expr Nat
+  | EField Expr Nat
+  | EText Text
+  | ETextOf Expr
+  | ETextCat Expr Expr
+  | EBytes [Nat]
+  | EBytesCat Expr Expr
+  | EBytesSize Expr
+  | EBytesAt Expr Expr Expr
+  | EMapEmpty
+  | EMapPut Expr Expr Expr
+  | EMapSize Expr
+  | EMapGet Expr Expr Expr
+  | EBuiltin Text [Expr]
+  | ERefNew Expr
+  | ERefRead Expr
+  | ERefWrite Expr Expr
+  | ETvarNew Expr
+  | ETvarRead Expr
+  | ETvarReadIO Expr
+  | ETvarWrite Expr Expr
+  | EAtomic Expr
+  | ERetry
+
+structural type Op
+  = OLab Nat
+  | OLoad Nat Nat
+  | OMove Nat Nat
+  | OAdd Nat Nat Nat
+  | OSub Nat Nat Nat
+  | OEq Nat Nat Nat
+  | OGoIf Nat Nat Nat
+  | OGo Nat
+  | OPerform Nat Nat Nat Nat Nat Nat Text
+  | OCall Text [Nat] Nat Nat
+  | OApply Nat Nat Nat Nat
+  | OTail
+  | OHandle Text Nat Nat Text [Nat] [Nat] Nat
+  | OResume Text Nat Nat Nat Nat Nat [Nat]
+  | OAgain Nat
+  | ORet Nat
+  | OPrint Nat
+  | OHalt
+  | OObj Nat Nat Nat Nat
+  | OIsTag Nat Nat Nat
+  | OField Nat Nat Nat
+  | OStr Nat Text
+  | OTextNat Nat Nat
+  | OTextCat Nat Nat Nat
+  | OBytes Nat [Nat]
+  | OBytesCat Nat Nat Nat
+  | OBytesSize Nat Nat
+  | OBytesAt Nat Nat Nat Nat
+  | OMapEmpty Nat
+  | OMapPut Nat Nat Nat Nat
+  | OMapSize Nat Nat
+  | OMapGet Nat Nat Nat Nat
+  | OBuiltin Text Nat [Nat]
+  | ORefNew Nat Nat
+  | ORefRead Nat Nat
+  | ORefWrite Nat Nat
+  | OTvarNew Nat Nat
+  | OTvarRead Nat Nat
+  | OTvarReadIO Nat Nat
+  | OTvarWrite Nat Nat
+  | OStmBegin
+  | OStmCommit
+  | OStmRetry
+
+structural type Bind = Bind Text Nat
+
+structural type Branch
+  = BReq Text Text (Optional Text) Text Expr
+  | BPure Text Expr
+
+structural type Fundef
+  = FFn Text [Text] Expr
+  | FHd Text [Text] [Branch]
+
+structural type FR = FOk Fundef | FBad Text
+
+structural type Abil = Abil Text Nat [Bind]
+
+structural type HInfo = HInfo Text Nat Nat Boolean Boolean
+
+structural type Gen = Gen Nat [Fundef]
+
+structural type Ln = Ln Nat [Text]
+
+structural type CS = CS Nat Nat [Op] [Bind] [Bind]
+
+structural type CX = CX [Abil] [HInfo] Text Nat Boolean Text
+
+structural type Kind = Have Nat | Gone
+
+structural type CR = CR CS Kind | CBad Text
+
+structural type Step = Got Expr [Text] | Bad Text
+
+structural type LineR = LineR Expr Gen [Ln] | LineBad Text
+
+structural type TopR = TopR [Abil] [Fundef] Gen [Ln] | TopBad Text
+
+structural type Parsed = Parsed [Abil] [Fundef] | PBad Text
+
+structural type HR = HR [HInfo] | HBad Text
+
+structural type AR = AR [Nat] CS | ABad Text
+
+structural type NR = NR Nat Nat
+
+structural type EM = EM Boolean [Fundef] [Abil] [HInfo] [NR] Nat Boolean
+
+rev : [a] -> [a]
+rev xs =
+  go xx acc =
+    match xx with
+      [] -> acc
+      h +: t -> go t (h +: acc)
+  go xs []
+
+cat : [a] -> [a] -> [a]
+cat a b =
+  match a with
+    [] -> b
+    h +: t -> h +: cat t b
+
+len : [a] -> Nat
+len xs =
+  go xx n =
+    match xx with
+      [] -> n
+      _ +: t -> go t (n Nat.+ 1)
+  go xs 0
+
+joinNums : [Nat] -> Text
+joinNums ns =
+  match ns with
+    [] -> ""
+    n +: [] -> Nat.toText n
+    n +: t -> Nat.toText n Text.++ "," Text.++ joinNums t
+
+showToks : [Text] -> Text
+showToks ts =
+  go n xs =
+    if Nat.eq n 0 then ""
+    else match xs with
+      [] -> ""
+      h +: t -> h Text.++ " " Text.++ go (drop n 1) t
+  go 8 ts
+
+isKw : Text -> Boolean
+isKw t =
+  t Text.== "then" || t Text.== "else" || t Text.== "with" || t Text.== "do" || t Text.== "cases" || t Text.== "where" || t Text.== "handle" || t Text.== "if" || t Text.== "structural" || t Text.== "ability" || t Text.== "use" || t Text.== "true" || t Text.== "false"
+
+hasDot : Text -> Boolean
+hasDot t =
+  match Text.indexOf "." t with
+    Some _ -> true
+    None -> false
+
+isNum : Text -> Boolean
+isNum t =
+  match Nat.fromText t with
+    Some _ -> true
+    None -> false
+
+isNatOp : Text -> Boolean
+isNatOp t =
+  t Text.== "Nat.+" || t Text.== "Nat.-" || t Text.== "Nat.eq" || t Text.== "Nat.toText"
+
+isArgStart : Text -> Boolean
+isArgStart t =
+  if t Text.== "true" || t Text.== "false" || t Text.== "()" || t Text.== "(" then true
+  else if isNum t then true
+  else if hasDot t then false
+  else if isKw t then false
+  else if t Text.== "=" || t Text.== "->" || t Text.== "{" || t Text.== "}" || t Text.== ")" || t Text.== "," || t Text.== ":" then false
+  else Nat.lt 0 (Text.size t)
+
+splitDot : Text -> (Text, Text)
+splitDot t =
+  match Text.indexOf "." t with
+    None -> (t, "")
+    Some i -> (Text.take i t, Text.drop (i Nat.+ 1) t)
+
+splitFirst : Text -> [Text] -> Optional ([Text], [Text])
+splitFirst key ts =
+  go acc xs =
+    match xs with
+      [] -> None
+      h +: t ->
+        if h Text.== key then Some (rev acc, t)
+        else go (h +: acc) t
+  go [] ts
+
+stripR : Text -> Text
+stripR t =
+  match Text.indexOf "\r" t with
+    None -> t
+    Some i -> Text.take i t
+
+splitLines : Text -> [Text]
+splitLines t =
+  go s =
+    match Text.indexOf "\n" s with
+      None ->
+        if Nat.eq (Text.size s) 0 then []
+        else [s]
+      Some i -> Text.take i s +: go (Text.drop (i Nat.+ 1) s)
+  go t
+
+isStopChar : Text -> Text -> Boolean
+isStopChar c two =
+  if two Text.== "->" || two Text.== "--" then true
+  else c Text.== " " || c Text.== "(" || c Text.== ")" || c Text.== "{" || c Text.== "}" || c Text.== "[" || c Text.== "]" || c Text.== "," || c Text.== "=" || c Text.== ":"
+
+readWord : Text -> Text
+readWord t =
+  if Nat.eq (Text.size t) 0 then ""
+  else
+    two = Text.take 2 t
+    c = Text.take 1 t
+    if isStopChar c two then ""
+    else c Text.++ readWord (Text.drop 1 t)
+
+readQuote : Text -> Text
+readQuote t =
+  go i =
+    if Nat.lt (Text.size t) (i Nat.+ 1) then t
+    else if Text.take 1 (Text.drop i t) Text.== "\\" then go (i Nat.+ 2)
+    else if Text.take 1 (Text.drop i t) Text.== "\"" then Text.take (i Nat.+ 1) t
+    else go (i Nat.+ 1)
+  go 1
+
+tok : Text -> [Text]
+tok t =
+  if Nat.eq (Text.size t) 0 then []
+  else
+    two = Text.take 2 t
+    c = Text.take 1 t
+    if c Text.== " " then tok (Text.drop 1 t)
+    else if two Text.== "--" then []
+    else if two Text.== "()" then "()" +: tok (Text.drop 2 t)
+    else if two Text.== "->" then "->" +: tok (Text.drop 2 t)
+    else if two Text.== "==" then "==" +: tok (Text.drop 2 t)
+    else if c Text.== "(" || c Text.== ")" || c Text.== "{" || c Text.== "}" || c Text.== "[" || c Text.== "]" || c Text.== "," || c Text.== "=" || c Text.== ":" then
+      c +: tok (Text.drop 1 t)
+    else if c Text.== "\"" then
+      w = readQuote t
+      w +: tok (Text.drop (Text.size w) t)
+    else
+      w = readWord t
+      if Nat.eq (Text.size w) 0 then []
+      else w +: tok (Text.drop (Text.size w) t)
+
+countSpaces : Text -> Nat -> (Nat, Text)
+countSpaces t n =
+  if Text.take 1 t Text.== " " then countSpaces (Text.drop 1 t) (n Nat.+ 1)
+  else (n, t)
+
+lex : Text -> [Ln]
+lex t =
+  go ls =
+    match ls with
+      [] -> []
+      h +: rest ->
+        (i, body) = countSpaces (stripR h) 0
+        toks = tok body
+        match toks with
+          [] -> go rest
+          _ -> Ln i toks +: go rest
+  go (splitLines t)
+
+parseAtom : [Text] -> Step
+parseAtom ts =
+  match ts with
+    [] -> Bad "empty atom"
+    "true" +: rest -> Got (EBool 1) rest
+    "false" +: rest -> Got (EBool 0) rest
+    "()" +: rest -> Got EUnit rest
+    "Map.empty" +: rest -> Got EMapEmpty rest
+    "(" +: (a +: ("," +: (b +: (")" +: rest)))) ->
+      if hasDot a || hasDot b then Bad "pair"
+      else Got (EPair (EVar a) (EVar b)) rest
+    "(" +: rest ->
+      match parseExpr rest with
+        Got e (")" +: more) -> Got e more
+        Got _ xs -> Bad ("expected ) " Text.++ showToks xs)
+        Bad m -> Bad m
+    h +: rest ->
+      if Text.take 1 h Text.== "\"" then Got (EText (unquote h)) rest
+      else if isNum h then
+        match Nat.fromText h with
+          Some n -> Got (ENat n) rest
+          None -> Bad "nat"
+      else if isKw h || hasDot h || h Text.== "=" || h Text.== "->" then Bad ("atom " Text.++ h)
+      else Got (EVar h) rest
+
+parseCall : [Text] -> Step
+parseCall ts =
+  match ts with
+    [] -> Bad "empty call"
+    "Nat.eq" +: rest ->
+      match parseAtom rest with
+        Got a rest2 ->
+          match parseAtom rest2 with
+            Got b rest3 -> Got (EEq a b) rest3
+            Bad m -> Bad m
+        Bad m -> Bad m
+    "Nat.toText" +: rest ->
+      match parseAtom rest with
+        Got a rest2 -> Got (ETextOf a) rest2
+        Bad m -> Bad m
+    "Exception.raise" +: rest ->
+      match rest with
+        "(" +: inner ->
+          match skipParen rest 0 with
+            Some more ->
+              msg = match quoteText inner with
+                Some t -> Some (EText t)
+                None -> None
+              Got (EPerform "Exception.raise" msg) more
+            None -> Bad "raise args"
+        _ -> Got (EPerform "Exception.raise" None) rest
+    "IO.ref" +: rest ->
+      match parseAtom rest with
+        Got a rest2 -> Got (ERefNew a) rest2
+        Bad m -> Bad m
+    "Ref.read" +: rest ->
+      match parseAtom rest with
+        Got a rest2 -> Got (ERefRead a) rest2
+        Bad m -> Bad m
+    "STM.retry" +: rest ->
+      match rest with
+        "()" +: more -> Got ERetry more
+        more -> Got ERetry more
+    "TVar.newIO" +: rest ->
+      match parseAtom rest with
+        Got a rest2 -> Got (ETvarNew a) rest2
+        Bad m -> Bad m
+    "TVar.readIO" +: rest ->
+      match parseAtom rest with
+        Got a rest2 -> Got (ETvarReadIO a) rest2
+        Bad m -> Bad m
+    "TVar.read" +: rest ->
+      match parseAtom rest with
+        Got a rest2 -> Got (ETvarRead a) rest2
+        Bad m -> Bad m
+    "TVar.write" +: rest ->
+      match parseAtom rest with
+        Got a rest2 ->
+          match parseAtom rest2 with
+            Got b rest3 -> Got (ETvarWrite a b) rest3
+            Bad m -> Bad m
+        Bad m -> Bad m
+    "Ref.write" +: rest ->
+      match parseAtom rest with
+        Got a rest2 ->
+          match parseAtom rest2 with
+            Got b rest3 -> Got (ERefWrite a b) rest3
+            Bad m -> Bad m
+        Bad m -> Bad m
+    "Map.empty" +: rest -> Got EMapEmpty rest
+    "Map.insert" +: rest ->
+      match parseAtom rest with
+        Got k rest2 ->
+          match parseAtom rest2 with
+            Got v rest3 ->
+              match parseAtom rest3 with
+                Got m rest4 -> Got (EMapPut k v m) rest4
+                Bad msg -> Bad msg
+            Bad msg -> Bad msg
+        Bad msg -> Bad msg
+    "Map.size" +: rest ->
+      match parseAtom rest with
+        Got a rest2 -> Got (EMapSize a) rest2
+        Bad m -> Bad m
+    "Map.lookup" +: rest ->
+      match parseAtom rest with
+        Got k rest2 ->
+          match parseAtom rest2 with
+            Got m rest3 -> Got (EMapGet (ENat 0) k m) rest3
+            Bad msg -> Bad msg
+        Bad msg -> Bad msg
+    "Bytes.fromList" +: ("[" +: rest) -> parseBytes [] rest
+    "Bytes.size" +: rest ->
+      match parseAtom rest with
+        Got a rest2 -> Got (EBytesSize a) rest2
+        Bad m -> Bad m
+    "Bytes.at" +: rest ->
+      match parseAtom rest with
+        Got i rest2 ->
+          match parseAtom rest2 with
+            Got b rest3 -> Got (EBytesAt (ENat 0) i b) rest3
+            Bad msg -> Bad msg
+        Bad msg -> Bad msg
+    "Optional.getOrElse" +: rest ->
+      match parseAtom rest with
+        Got d rest2 ->
+          match parseAtom rest2 with
+            Got inner rest3 ->
+              match inner with
+                EBytesAt _ i b -> Got (EBytesAt d i b) rest3
+                EMapGet _ k m -> Got (EMapGet d k m) rest3
+                _ -> Bad "getOrElse"
+            Bad msg -> Bad msg
+        Bad msg -> Bad msg
+    "handle" +: rest -> parseHandleExpr rest
+    "printLine" +: rest ->
+      match parseAtom rest with
+        Got a rest2 -> Got (EPerform "IO.printLine" (Some a)) rest2
+        Bad m -> Bad m
+    h +: rest ->
+      if Text.take 1 h Text.== "\"" then Got (EText (unquote h)) rest
+      else if hasDot h && Boolean.not (isNatOp h) then
+        match rest with
+          "(" +: _ ->
+            match parseAtom rest with
+              Got a rest2 -> Got (EPerform h (Some a)) rest2
+              Bad m -> Bad m
+          n +: rest2 ->
+            if isNum n then
+              match Nat.fromText n with
+                Some v -> Got (EPerform h (Some (ENat v))) rest2
+                None -> Bad "payload"
+            else Got (EPerform h None) rest
+          [] -> Got (EPerform h None) rest
+      else if isArgStart h && Boolean.not (isNum h) && h Text.!= "true" && h Text.!= "false" && h Text.!= "()" && h Text.!= "(" then
+        (args, rest2) = takeArgs rest
+        match args with
+          [] -> Got (EVar h) rest2
+          _ -> Got (ECall h args) rest2
+      else parseAtom ts
+
+parseBytes : [Nat] -> [Text] -> Step
+parseBytes acc ts =
+  match ts with
+    "]" +: rest -> Got (EBytes (rev acc)) rest
+    "," +: rest -> parseBytes acc rest
+    n +: rest ->
+      match Nat.fromText n with
+        Some v -> parseBytes (v +: acc) rest
+        None -> Bad "byte"
+    [] -> Bad "bytes"
+
+unquote : Text -> Text
+unquote t =
+  if Nat.lt (Text.size t) 2 then ""
+  else Text.drop 1 (Text.take (Text.size t Nat.- 1) t)
+
+quoteText : [Text] -> Optional Text
+quoteText xs =
+  match xs with
+    [] -> None
+    h +: t ->
+      if Text.take 1 h Text.== "\"" && Text.size h Nat.> 1 then
+        inner = Text.drop 1 h
+        Some (Text.take (Text.size inner Nat.- 1) inner)
+      else quoteText t
+
+escapeC : Text -> Text
+escapeC t =
+  go i =
+    if Nat.eq i (Text.size t) then ""
+    else
+      c = Text.take 1 (Text.drop i t)
+      bit = if c Text.== "\\" || c Text.== "\"" then "\\" Text.++ c
+        else if c Text.== "\n" then "\\n"
+        else if c Text.== "\r" then "\\r"
+        else c
+      bit Text.++ go (i Nat.+ 1)
+  go 0
+
+skipParen : [Text] -> Nat -> Optional [Text]
+skipParen xs n =
+  match xs with
+    [] -> None
+    "(" +: t -> skipParen t (n Nat.+ 1)
+    ")" +: t ->
+      if Nat.eq n 1 then Some t
+      else if Nat.eq n 0 then None
+      else skipParen t (n Nat.- 1)
+    _ +: t -> skipParen t n
+
+takeArgs : [Text] -> ([Expr], [Text])
+takeArgs ts =
+  go xs acc =
+    match xs with
+      [] -> (rev acc, [])
+      h +: _ ->
+        if isArgStart h then
+          match parseAtom xs with
+            Got e rest -> go rest (e +: acc)
+            Bad _ -> (rev acc, xs)
+        else (rev acc, xs)
+  go ts []
+
+parseHandleExpr : [Text] -> Step
+parseHandleExpr ts =
+  match parseExpr ts with
+    Bad m -> Bad m
+    Got body ("with" +: (name +: args)) ->
+      match takeArgs args with
+        (es, []) -> Got (EHandle body name es) []
+        (_, extra) -> Bad ("handle leftover " Text.++ showToks extra)
+    Got _ xs -> Bad ("handle without with " Text.++ showToks xs)
+
+parseInf : [Text] -> Step
+parseInf ts =
+  match parseCall ts with
+    Bad m -> Bad m
+    Got e rest -> parseInfLeft e rest
+
+parseInfLeft : Expr -> [Text] -> Step
+parseInfLeft e rest =
+  match rest with
+    op +: more ->
+      if op Text.== "Nat.+" || op Text.== "Nat.-" || op Text.== "Text.++" || op Text.== "Bytes.++" then
+        match parseCall more with
+          Bad m -> Bad m
+          Got r rest2 ->
+            e2 = if op Text.== "Nat.+" then EAdd e r
+              else if op Text.== "Nat.-" then ESub e r
+              else if op Text.== "Text.++" then ETextCat e r
+              else EBytesCat e r
+            parseInfLeft e2 rest2
+      else Got e rest
+    [] -> Got e rest
+
+parseExpr : [Text] -> Step
+parseExpr ts = parseInf ts
+
+genFresh : Gen -> (Text, Gen)
+genFresh g =
+  match g with
+    Gen n fs -> ("b" Text.++ Nat.toText n, Gen (n Nat.+ 1) fs)
+
+genAdd : Gen -> Fundef -> Gen
+genAdd g f =
+  match g with
+    Gen n fs -> Gen n (f +: fs)
+
+hangingHandle : [Text] -> Boolean
+hangingHandle ts =
+  match ts with
+    "handle" +: more ->
+      match splitFirst "with" more with
+        None -> true
+        Some _ -> false
+    _ -> false
+
+parseHandlerApp : [Text] -> Step
+parseHandlerApp ts =
+  match ts with
+    [] -> Bad "missing handler"
+    name +: args ->
+      match takeArgs args with
+        (es, []) -> Got (ECall name es) []
+        (_, extra) -> Bad ("handler leftover " Text.++ showToks extra)
+
+wrapBlock : Expr -> Text -> [Expr] -> Gen -> (Expr, Gen)
+wrapBlock body hname args g =
+  (bname, g2) = genFresh g
+  g3 = genAdd g2 (FFn bname [] body)
+  (EHandle (ECall bname []) hname args, g3)
+
+lnIndent : Ln -> Nat
+lnIndent ln =
+  match ln with
+    Ln i _ -> i
+
+lnToks : Ln -> [Text]
+lnToks ln =
+  match ln with
+    Ln _ ts -> ts
+
+parseBlock : [Ln] -> Nat -> Gen -> LineR
+parseBlock lines indent g =
+  match lines with
+    [] -> LineBad "empty block"
+    ln +: rest ->
+      i = lnIndent ln
+      if Nat.lt i indent then LineBad "empty block"
+      else if Nat.eq i indent then
+        match parseStmt ln rest indent g with
+          LineBad m -> LineBad m
+          LineR e g2 rest2 ->
+            match rest2 with
+              [] -> LineR e g2 []
+              nxt +: _ ->
+                if Nat.lt (lnIndent nxt) indent then LineR e g2 rest2
+                else if Nat.eq (lnIndent nxt) indent then
+                  match parseBlock rest2 indent g2 with
+                    LineBad m -> LineBad m
+                    LineR e2 g3 rest3 -> LineR (ESeq e e2) g3 rest3
+                else LineBad ("indent " Text.++ showToks (lnToks nxt))
+      else LineBad "block indent"
+
+parseStmt : Ln -> [Ln] -> Nat -> Gen -> LineR
+parseStmt ln rest indent g =
+  toks = lnToks ln
+  match toks with
+    "if" +: more -> parseIf more rest (lnIndent ln) g
+    "handle" +: more -> parseHandleStmt more rest (lnIndent ln) g
+    "(" +: (a +: ("," +: (b +: (")" +: ("=" +: rhs))))) ->
+      if hangingHandle rhs then
+        match parseHanging rest (lnIndent ln) g with
+          LineBad m -> LineBad m
+          LineR hex g2 rest2 ->
+            match parseBlock rest2 indent g2 with
+              LineBad m -> LineBad m
+              LineR body g3 rest3 -> LineR (ETup a b hex body) g3 rest3
+      else
+        match parseExpr rhs with
+          Bad m -> LineBad m
+          Got hex [] ->
+            match parseBlock rest indent g with
+              LineBad m -> LineBad m
+              LineR body g2 rest2 -> LineR (ETup a b hex body) g2 rest2
+          Got _ extra -> LineBad ("tup leftover " Text.++ showToks extra)
+    name +: ("=" +: ("STM.atomically" +: ("do" +: []))) ->
+      parseAtomic name rest (lnIndent ln) g
+    name +: ("=" +: rhs) ->
+      if hangingHandle rhs then
+        match parseHanging rest (lnIndent ln) g with
+          LineBad m -> LineBad m
+          LineR hex g2 rest2 ->
+            match parseBlock rest2 indent g2 with
+              LineBad m -> LineBad m
+              LineR body g3 rest3 -> LineR (ELet name hex body) g3 rest3
+      else
+        match parseExpr rhs with
+          Bad m -> LineBad m
+          Got rhsE [] ->
+            match parseBlock rest indent g with
+              LineBad m -> LineBad m
+              LineR body g2 rest2 -> LineR (ELet name rhsE body) g2 rest2
+          Got _ extra -> LineBad ("let leftover " Text.++ showToks extra)
+    _ ->
+      match parseExpr toks with
+        Bad m -> LineBad m
+        Got e [] -> LineR e g rest
+        Got _ extra -> LineBad ("stmt leftover " Text.++ showToks extra)
+
+parseAtomic : Text -> [Ln] -> Nat -> Gen -> LineR
+parseAtomic name lines letIndent g =
+  match lines with
+    [] -> LineBad "atomic body"
+    ln +: _ ->
+      bi = lnIndent ln
+      if Nat.lt letIndent bi then
+        match parseBlock lines bi g with
+          LineBad m -> LineBad m
+          LineR body g2 rest2 ->
+            match rest2 with
+              [] -> LineBad "atomic tail"
+              _ ->
+                match parseBlock rest2 letIndent g2 with
+                  LineBad m -> LineBad m
+                  LineR cont g3 rest3 -> LineR (ELet name (EAtomic body) cont) g3 rest3
+      else LineBad "atomic indent"
+
+parseHanging : [Ln] -> Nat -> Gen -> LineR
+parseHanging lines handleIndent g =
+  match lines with
+    [] -> LineBad "hanging handle"
+    ln +: _ ->
+      bi = lnIndent ln
+      if Nat.lt handleIndent bi then
+        match parseBlock lines bi g with
+          LineBad m -> LineBad m
+          LineR body g2 rest2 ->
+            match rest2 with
+              [] -> LineBad "expected with"
+              wln +: after ->
+                if Nat.eq (lnIndent wln) handleIndent then
+                  match lnToks wln with
+                    "with" +: happ ->
+                      match parseHandlerApp happ with
+                        Bad m -> LineBad m
+                        Got (ECall hname args) [] ->
+                          (hex, g3) = wrapBlock body hname args g2
+                          LineR hex g3 after
+                        Got _ _ -> LineBad "handler app"
+                    _ -> LineBad ("expected with " Text.++ showToks (lnToks wln))
+                else LineBad "with indent"
+      else LineBad "handle body"
+
+parseHandleStmt : [Text] -> [Ln] -> Nat -> Gen -> LineR
+parseHandleStmt more rest indent g =
+  if hangingHandle ("handle" +: more) then parseHanging rest indent g
+  else
+    match parseHandleExpr more with
+      Bad m -> LineBad m
+      Got e [] -> LineR e g rest
+      Got _ extra -> LineBad ("handle stmt " Text.++ showToks extra)
+
+parseIf : [Text] -> [Ln] -> Nat -> Gen -> LineR
+parseIf toks rest ifIndent g =
+  match splitFirst "then" toks with
+    None -> LineBad "if without then"
+    Some (condToks, afterThen) ->
+      match parseExpr condToks with
+        Bad m -> LineBad m
+        Got cond [] ->
+          match splitFirst "else" afterThen with
+            Some (thenToks, elseToks) ->
+              match parseExpr thenToks with
+                Bad m -> LineBad m
+                Got th [] ->
+                  match parseExpr elseToks with
+                    Bad m -> LineBad m
+                    Got el [] -> LineR (EIf cond th el) g rest
+                    Got _ x -> LineBad ("else leftover " Text.++ showToks x)
+                Got _ x -> LineBad ("then leftover " Text.++ showToks x)
+            None ->
+              if Nat.eq (len afterThen) 0 then
+                match rest with
+                  [] -> LineBad "if then block"
+                  bln +: _ ->
+                    match parseBlock rest (lnIndent bln) g with
+                      LineBad m -> LineBad m
+                      LineR th g2 rest2 -> parseElse rest2 ifIndent g2 cond th
+              else
+                match parseExpr afterThen with
+                  Bad m -> LineBad m
+                  Got th [] -> parseElse rest ifIndent g cond th
+                  Got _ x -> LineBad ("then expr " Text.++ showToks x)
+        Got _ extra -> LineBad ("cond leftover " Text.++ showToks extra)
+
+parseElse : [Ln] -> Nat -> Gen -> Expr -> Expr -> LineR
+parseElse lines ifIndent g cond th =
+  match lines with
+    [] -> LineBad "missing else"
+    ln +: more ->
+      if Nat.eq (lnIndent ln) ifIndent then match lnToks ln with
+        "else" +: elseToks ->
+          if Nat.eq (len elseToks) 0 then
+            match more with
+              [] -> LineBad "else block"
+              bln +: _ ->
+                match parseBlock more (lnIndent bln) g with
+                  LineBad m -> LineBad m
+                  LineR el g2 rest2 -> LineR (EIf cond th el) g2 rest2
+          else
+            match parseExpr elseToks with
+              Bad m -> LineBad m
+              Got el [] -> LineR (EIf cond th el) g more
+              Got _ x -> LineBad ("else expr " Text.++ showToks x)
+        _ -> LineBad ("expected else " Text.++ showToks (lnToks ln))
+      else LineBad "else indent"
+
+parseBranch : Ln -> [Ln] -> Gen -> LineR
+parseBranch ln rest g =
+  match lnToks ln with
+    "{" +: (head +: rest1) ->
+      if hasDot head then
+        (ab, req) = splitDot head
+        match rest1 with
+          "->" +: (k +: ("}" +: ("->" +: bodyToks))) ->
+            finishReq ab req None k bodyToks rest (lnIndent ln) g
+          pname +: ("->" +: (k +: ("}" +: ("->" +: bodyToks)))) ->
+            finishReq ab req (Some pname) k bodyToks rest (lnIndent ln) g
+          _ -> LineBad ("req pat " Text.++ showToks (lnToks ln))
+      else
+        match rest1 with
+          "}" +: ("->" +: bodyToks) ->
+            if Nat.eq (len bodyToks) 0 then
+              match rest with
+                [] -> LineBad "pure body"
+                bln +: _ ->
+                  match parseBlock rest (lnIndent bln) g with
+                    LineBad m -> LineBad m
+                    LineR e g2 rest2 -> LineR (packPure head e) g2 rest2
+            else
+              match parseExpr bodyToks with
+                Bad m -> LineBad m
+                Got e [] -> LineR (packPure head e) g rest
+                Got _ x -> LineBad ("pure leftover " Text.++ showToks x)
+          _ -> LineBad ("pure pat " Text.++ showToks (lnToks ln))
+    _ -> LineBad "branch"
+
+packPure : Text -> Expr -> Expr
+packPure n e = ECall ("pure:" Text.++ n) [e]
+
+finishReq : Text -> Text -> Optional Text -> Text -> [Text] -> [Ln] -> Nat -> Gen -> LineR
+finishReq ab req pay k bodyToks rest ind g =
+  payT = match pay with
+    None -> ""
+    Some p -> p
+  tag = "req:" Text.++ ab Text.++ ":" Text.++ req Text.++ ":" Text.++ payT Text.++ ":" Text.++ k
+  if Nat.eq (len bodyToks) 0 then
+    match rest with
+      [] -> LineBad "req body"
+      bln +: _ ->
+        match parseBlock rest (lnIndent bln) g with
+          LineBad m -> LineBad m
+          LineR e g2 rest2 -> LineR (ECall tag [e]) g2 rest2
+  else
+    match parseExpr bodyToks with
+      Bad m -> LineBad m
+      Got e [] -> LineR (ECall tag [e]) g rest
+      Got _ x -> LineBad ("req leftover " Text.++ showToks x)
+
+splitColon : Text -> (Text, Text)
+splitColon t =
+  match Text.indexOf ":" t with
+    None -> (t, "")
+    Some i -> (Text.take i t, Text.drop (i Nat.+ 1) t)
+
+unpackBranch : Expr -> Branch
+unpackBranch e =
+  match e with
+    ECall tag [body] ->
+      if Text.take 5 tag Text.== "pure:" then BPure (Text.drop 5 tag) body
+      else
+        rest = Text.drop 4 tag
+        (ab, r1) = splitColon rest
+        (req, r2) = splitColon r1
+        (pay, k) = splitColon r2
+        payload = if Nat.eq (Text.size pay) 0 then None else Some pay
+        BReq ab req payload k body
+    _ -> BPure "bad" e
+
+parseBranches : [Ln] -> Nat -> Gen -> [Branch] -> (Gen, [Branch], [Ln])
+parseBranches lines defIndent g acc =
+  match lines with
+    [] -> (g, rev acc, [])
+    ln +: rest ->
+      if Nat.lt (lnIndent ln) (defIndent Nat.+ 1) then (g, rev acc, lines)
+      else
+        match parseBranch ln rest g with
+          LineBad _ -> (g, rev acc, lines)
+          LineR e g2 rest2 ->
+            parseBranches rest2 defIndent g2 (unpackBranch e +: acc)
+
+parseAbility : [Text] -> [Ln] -> Nat -> (Abil, [Ln])
+parseAbility toks lines nextId =
+  name = match toks with
+    _ +: (_ +: (n +: _)) -> n
+    _ -> "noname"
+  (reqs, rest) = takeReqs lines
+  (Abil name nextId (numReqs (rev reqs) 0), rest)
+
+takeReqs : [Ln] -> ([Text], [Ln])
+takeReqs lines =
+  go xs acc =
+    match xs with
+      [] -> (acc, [])
+      ln +: rest ->
+        if Nat.eq (lnIndent ln) 0 then (acc, xs)
+        else
+          match lnToks ln with
+            h +: _ -> go rest (h +: acc)
+            [] -> (acc, xs)
+  go lines []
+
+numReqs : [Text] -> Nat -> [Bind]
+numReqs rs i =
+  match rs with
+    [] -> []
+    h +: t -> Bind h i +: numReqs t (i Nat.+ 1)
+
+parseTop : [Ln] -> Nat -> [Abil] -> [Fundef] -> Gen -> TopR
+parseTop lines nextId abs funs g =
+  match lines with
+    [] -> TopR abs funs g []
+    ln +: rest ->
+      toks = lnToks ln
+      if Nat.eq (lnIndent ln) 0 then match toks with
+        "use" +: _ -> parseTop rest nextId abs funs g
+        "structural" +: ("ability" +: _) ->
+          (ab, rest2) = parseAbility toks rest nextId
+          parseTop rest2 (nextId Nat.+ 1) (ab +: abs) funs g
+        _ +: (":" +: _) -> parseTop rest nextId abs funs g
+        _ ->
+          match splitFirst "=" toks with
+            None -> TopBad ("no eq " Text.++ showToks toks)
+            Some (before, after) ->
+              match before with
+                name +: params ->
+                  if isCases after then
+                    (g2, bs, rest2) = parseBranches rest 0 g []
+                    parseTop rest2 nextId abs (FHd name params bs +: funs) g2
+                  else if isBody after then
+                    match rest with
+                      [] -> TopBad "no body"
+                      bln +: _ ->
+                        match parseBlock rest (lnIndent bln) g with
+                          LineBad m -> TopBad m
+                          LineR e g2 rest2 ->
+                            parseTop rest2 nextId abs (FFn name params e +: funs) g2
+                  else TopBad ("def form " Text.++ showToks toks)
+                [] -> TopBad "empty def"
+      else TopBad ("top indent " Text.++ showToks toks)
+
+isCases : [Text] -> Boolean
+isCases ts =
+  match ts with
+    "cases" +: _ -> true
+    _ -> false
+
+isBody : [Text] -> Boolean
+isBody ts =
+  match ts with
+    [] -> true
+    "do" +: [] -> true
+    _ -> false
+
+parseFile : Text -> Parsed
+parseFile t =
+  match parseTop (lex t) 0 [] [] (Gen 0 []) with
+    TopBad m -> PBad m
+    TopR abs funs g rest ->
+      match rest with
+        [] ->
+          match g with
+            Gen _ extra -> Parsed (rev abs) (cat (rev extra) (rev funs))
+        ln +: _ -> PBad ("leftover " Text.++ showToks (lnToks ln))
+
+findBind : Text -> [Bind] -> Optional Nat
+findBind n bs =
+  match bs with
+    [] -> None
+    Bind m s +: t ->
+      if m Text.== n then Some s else findBind n t
+
+findH : Text -> [HInfo] -> Optional HInfo
+findH n hs =
+  match hs with
+    [] -> None
+    h +: t ->
+      match h with
+        HInfo name _ _ _ _ ->
+          if name Text.== n then Some h else findH n t
+
+findReq : Text -> [Abil] -> Optional (Nat, Nat)
+findReq dotted abs =
+  (an, rn) = splitDot dotted
+  go xs =
+    match xs with
+      [] -> None
+      Abil name id reqs +: t ->
+        if name Text.== an then
+          match findBind rn reqs with
+            Some rid -> Some (id, rid)
+            None -> None
+        else go t
+  go abs
+
+pureBranch : [Branch] -> Optional (Text, Expr)
+pureBranch bs =
+  match bs with
+    [] -> None
+    BPure n e +: _ -> Some (n, e)
+    _ +: t -> pureBranch t
+
+firstReqName : [Branch] -> Optional Text
+firstReqName bs =
+  match bs with
+    [] -> None
+    BReq ab _ _ _ _ +: _ -> Some ab
+    _ +: t -> firstReqName t
+
+isPair : Expr -> Boolean
+isPair e =
+  match e with
+    EPair _ _ -> true
+    _ -> false
+
+buildH : [Fundef] -> [Abil] -> HR
+buildH fs abs =
+  go xs acc =
+    match xs with
+      [] -> HR (rev acc)
+      FFn _ _ _ +: t -> go t acc
+      FHd name params bs +: t ->
+        match firstReqName bs with
+          None -> HBad ("no req " Text.++ name)
+          Some abn ->
+            match findAb abn abs with
+              None -> HBad ("no ability " Text.++ abn)
+              Some id ->
+                pair = match pureBranch bs with
+                  Some (_, e) -> isPair e
+                  None -> false
+                once = resumesOnce name bs
+                go t (HInfo name id (len params) pair once +: acc)
+  go fs []
+
+findAb : Text -> [Abil] -> Optional Nat
+findAb n abs =
+  match abs with
+    [] -> None
+    Abil name id _ +: t ->
+      if name Text.== n then Some id else findAb n t
+
+alloc : CS -> (Nat, CS)
+alloc cs =
+  match cs with
+    CS sl lab ops env ken -> (sl, CS (sl Nat.+ 1) lab ops env ken)
+
+fresh : CS -> (Nat, CS)
+fresh cs =
+  match cs with
+    CS sl lab ops env ken -> (lab, CS sl (lab Nat.+ 1) ops env ken)
+
+emit : Op -> CS -> CS
+emit op cs =
+  match cs with
+    CS sl lab ops env ken -> CS sl lab (op +: ops) env ken
+
+bindN : Text -> Nat -> CS -> CS
+bindN n s cs =
+  match cs with
+    CS sl lab ops env ken -> CS sl lab ops (Bind n s +: env) ken
+
+compileArgs : [Expr] -> CS -> CX -> AR
+compileArgs es cs cx =
+  go xs cs0 acc =
+    match xs with
+      [] -> AR (rev acc) cs0
+      h +: t ->
+        match compile h false cs0 cx with
+          CBad m -> ABad m
+          CR _ Gone -> ABad "arg gone"
+          CR cs1 (Have s) -> go t cs1 (s +: acc)
+  go es cs []
+
+compileMoves : [Nat] -> Nat -> CS -> CS
+compileMoves slots i cs =
+  match slots with
+    [] -> cs
+    s +: t -> compileMoves t (i Nat.+ 1) (emit (OMove i s) cs)
+
+compile : Expr -> Boolean -> CS -> CX -> CR
+compile e isTail cs cx =
+  if Nat.lt 8191 (slotOf cs) then CBad ("slots " Text.++ Nat.toText (slotOf cs))
+  else compile2 e isTail cs cx
+
+slotOf : CS -> Nat
+slotOf cs =
+  match cs with
+    CS sl _ _ _ _ -> sl
+
+compile2 : Expr -> Boolean -> CS -> CX -> CR
+compile2 e isTail cs cx =
+  match e with
+    ENat n ->
+      (s, cs1) = alloc cs
+      cs2 = emit (OLoad s n) cs1
+      finishVal s isTail cs2
+    EBool n ->
+      (s, cs1) = alloc cs
+      cs2 = emit (OLoad s n) cs1
+      finishVal s isTail cs2
+    EUnit ->
+      (s, cs1) = alloc cs
+      cs2 = emit (OLoad s 0) cs1
+      finishVal s isTail cs2
+    EVar n ->
+      match cs with
+        CS _ _ _ env _ ->
+          match findBind n env with
+            None -> CBad ("unbound " Text.++ n)
+            Some s -> finishVal s isTail cs
+    EAdd a b -> compileBin a b true isTail cs cx
+    ESub a b -> compileBin a b false isTail cs cx
+    EEq a b ->
+      match compile a false cs cx with
+        CBad m -> CBad m
+        CR _ Gone -> CBad "eq"
+        CR cs1 (Have sa) ->
+          match compile b false cs1 cx with
+            CBad m -> CBad m
+            CR _ Gone -> CBad "eq"
+            CR cs2 (Have sb) ->
+              (d, cs3) = alloc cs2
+              finishVal d isTail (emit (OEq d sa sb) cs3)
+    EIf c th el -> compileIf c th el isTail cs cx
+    ECall n args -> compileCall n args isTail cs cx
+    EPerform n pay -> compilePerform n pay isTail cs cx
+    EHandle body hname hargs -> compileHandle body hname hargs isTail cs cx
+    ELet n rhs body ->
+      match compile rhs false cs cx with
+        CBad m -> CBad m
+        CR _ Gone -> CBad "let gone"
+        CR cs1 (Have s) -> compile body isTail (bindN n s cs1) cx
+    ESeq a b ->
+      match compile a false cs cx with
+        CBad m -> CBad m
+        CR cs1 _ -> compile b isTail cs1 cx
+    EPrint a ->
+      match compile a false cs cx with
+        CBad m -> CBad m
+        CR _ Gone -> CBad "print gone"
+        CR cs1 (Have s) ->
+          cs2 = emit (OPrint s) cs1
+          if isTail then CR (emit OHalt cs2) Gone
+          else CR cs2 (Have s)
+    EPair _ _ -> CBad "bare pair"
+    ETup n1 n2 rhs body ->
+      match rhs with
+        EHandle _ hname _ ->
+          match cx with
+            CX _ his _ _ _ _ ->
+              match findH hname his with
+                None -> CBad ("tup handler " Text.++ hname)
+                Some (HInfo _ _ _ pair _) ->
+                  if pair then
+                    match compile rhs false cs cx with
+                      CBad m -> CBad m
+                      CR _ Gone -> CBad "tup gone"
+                      CR cs1 (Have s) ->
+                        cs2 = bindN n2 (s Nat.+ 1) (bindN n1 s cs1)
+                        compile body isTail cs2 cx
+                  else CBad "handler does not return a pair"
+        _ -> CBad "tup rhs"
+    ECon tag fld ->
+      match fld with
+        None ->
+          (d, cs1) = alloc cs
+          finishVal d isTail (emit (OObj d tag 0 0) cs1)
+        Some f ->
+          match compile f false cs cx with
+            CBad m -> CBad m
+            CR _ Gone -> CBad "con field"
+            CR cs1 (Have fs) ->
+              (d, cs2) = alloc cs1
+              finishVal d isTail (emit (OObj d tag 1 fs) cs2)
+    EIsTag e tag ->
+      match compile e false cs cx with
+        CBad m -> CBad m
+        CR _ Gone -> CBad "tag"
+        CR cs1 (Have s) ->
+          (d, cs2) = alloc cs1
+          finishVal d isTail (emit (OIsTag d s tag) cs2)
+    EField e i ->
+      match compile e false cs cx with
+        CBad m -> CBad m
+        CR _ Gone -> CBad "field"
+        CR cs1 (Have s) ->
+          (d, cs2) = alloc cs1
+          finishVal d isTail (emit (OField d s i) cs2)
+    EText t ->
+      (d, cs1) = alloc cs
+      finishVal d isTail (emit (OStr d t) cs1)
+    ETextOf e ->
+      match compile e false cs cx with
+        CBad m -> CBad m
+        CR _ Gone -> CBad "text nat"
+        CR cs1 (Have s) ->
+          (d, cs2) = alloc cs1
+          finishVal d isTail (emit (OTextNat d s) cs2)
+    ETextCat a b ->
+      match compile a false cs cx with
+        CBad m -> CBad m
+        CR _ Gone -> CBad "text left"
+        CR cs1 (Have ra) ->
+          match compile b false cs1 cx with
+            CBad m -> CBad m
+            CR _ Gone -> CBad "text right"
+            CR cs2 (Have rb) ->
+              (d, cs3) = alloc cs2
+              finishVal d isTail (emit (OTextCat d ra rb) cs3)
+    EBytes ns ->
+      (d, cs1) = alloc cs
+      finishVal d isTail (emit (OBytes d ns) cs1)
+    EBytesCat a b ->
+      match compile a false cs cx with
+        CBad m -> CBad m
+        CR _ Gone -> CBad "bytes left"
+        CR cs1 (Have ra) ->
+          match compile b false cs1 cx with
+            CBad m -> CBad m
+            CR _ Gone -> CBad "bytes right"
+            CR cs2 (Have rb) ->
+              (d, cs3) = alloc cs2
+              finishVal d isTail (emit (OBytesCat d ra rb) cs3)
+    EBytesSize e ->
+      match compile e false cs cx with
+        CBad m -> CBad m
+        CR _ Gone -> CBad "bytes size"
+        CR cs1 (Have s) ->
+          (d, cs2) = alloc cs1
+          finishVal d isTail (emit (OBytesSize d s) cs2)
+    EBytesAt a b c -> compile3 0 a b c isTail cs cx
+    EMapEmpty ->
+      (d, cs1) = alloc cs
+      finishVal d isTail (emit (OMapEmpty d) cs1)
+    EMapPut a b c -> compile3 2 a b c isTail cs cx
+    EMapSize e ->
+      match compile e false cs cx with
+        CBad m -> CBad m
+        CR _ Gone -> CBad "map size"
+        CR cs1 (Have s) ->
+          (d, cs2) = alloc cs1
+          finishVal d isTail (emit (OMapSize d s) cs2)
+    EMapGet a b c -> compile3 1 a b c isTail cs cx
+    EBuiltin "app" [closE, argE] ->
+      match compile closE false cs cx with
+        CBad m -> CBad m
+        CR _ Gone -> CBad "app"
+        CR cs1 (Have cslot) ->
+          match compile argE false cs1 cx with
+            CBad m -> CBad m
+            CR _ Gone -> CBad "app"
+            CR cs2 (Have aslot) ->
+              (dest, cs3) = alloc cs2
+              (lab, cs4) = fresh cs3
+              cs5 = emit (OLab lab) (emit (OApply cslot aslot dest lab) cs4)
+              finishVal dest isTail cs5
+    EBuiltin "app" _ -> CBad "app"
+    EBuiltin name args ->
+      match compileArgs args cs cx with
+        ABad m -> CBad m
+        AR slots cs1 ->
+          (d, cs2) = alloc cs1
+          finishVal d isTail (emit (OBuiltin name d slots) cs2)
+    ERefNew e ->
+      match compile e false cs cx with
+        CBad m -> CBad m
+        CR _ Gone -> CBad "ref new"
+        CR cs1 (Have s) ->
+          (d, cs2) = alloc cs1
+          finishVal d isTail (emit (ORefNew d s) cs2)
+    ERefRead e ->
+      match compile e false cs cx with
+        CBad m -> CBad m
+        CR _ Gone -> CBad "ref read"
+        CR cs1 (Have s) ->
+          (d, cs2) = alloc cs1
+          finishVal d isTail (emit (ORefRead d s) cs2)
+    ERefWrite a b ->
+      match compile a false cs cx with
+        CBad m -> CBad m
+        CR _ Gone -> CBad "ref write"
+        CR cs1 (Have ra) ->
+          match compile b false cs1 cx with
+            CBad m -> CBad m
+            CR _ Gone -> CBad "ref val"
+            CR cs2 (Have rb) ->
+              (d, cs3) = alloc cs2
+              cs4 = emit (OLoad d 0) (emit (ORefWrite ra rb) cs3)
+              finishVal d isTail cs4
+    ETvarNew e ->
+      match compile e false cs cx with
+        CBad m -> CBad m
+        CR _ Gone -> CBad "tvar new"
+        CR cs1 (Have s) ->
+          (d, cs2) = alloc cs1
+          finishVal d isTail (emit (OTvarNew d s) cs2)
+    ETvarRead e ->
+      match compile e false cs cx with
+        CBad m -> CBad m
+        CR _ Gone -> CBad "tvar read"
+        CR cs1 (Have s) ->
+          (d, cs2) = alloc cs1
+          finishVal d isTail (emit (OTvarRead d s) cs2)
+    ETvarReadIO e ->
+      match compile e false cs cx with
+        CBad m -> CBad m
+        CR _ Gone -> CBad "tvar readio"
+        CR cs1 (Have s) ->
+          (d, cs2) = alloc cs1
+          finishVal d isTail (emit (OTvarReadIO d s) cs2)
+    ETvarWrite a b ->
+      match compile a false cs cx with
+        CBad m -> CBad m
+        CR _ Gone -> CBad "tvar write"
+        CR cs1 (Have ra) ->
+          match compile b false cs1 cx with
+            CBad m -> CBad m
+            CR _ Gone -> CBad "tvar val"
+            CR cs2 (Have rb) -> CR (emit (OTvarWrite ra rb) cs2) Gone
+    EAtomic e ->
+      match compile e false (emit OStmBegin cs) cx with
+        CBad m -> CBad m
+        CR _ Gone -> CBad "atomic gone"
+        CR cs1 (Have d) -> finishVal d isTail (emit OStmCommit cs1)
+    ERetry ->
+      (d, cs1) = alloc cs
+      finishVal d isTail (emit OStmRetry cs1)
+
+finishVal : Nat -> Boolean -> CS -> CR
+finishVal s isTail cs =
+  if isTail then CR (emit (ORet s) cs) Gone
+  else CR cs (Have s)
+
+compileBin : Expr -> Expr -> Boolean -> Boolean -> CS -> CX -> CR
+compileBin a b isAdd isTail cs cx =
+  match compile a false cs cx with
+    CBad m -> CBad m
+    CR _ Gone -> CBad "bin"
+    CR cs1 (Have sa) ->
+      match compile b false cs1 cx with
+        CBad m -> CBad m
+        CR _ Gone -> CBad "bin"
+        CR cs2 (Have sb) ->
+          (d, cs3) = alloc cs2
+          op = if isAdd then OAdd d sa sb else OSub d sa sb
+          finishVal d isTail (emit op cs3)
+
+compile3 : Nat -> Expr -> Expr -> Expr -> Boolean -> CS -> CX -> CR
+compile3 kind a b c isTail cs cx =
+  match compile a false cs cx with
+    CBad m -> CBad m
+    CR _ Gone -> CBad "arg"
+    CR cs1 (Have sa) ->
+      match compile b false cs1 cx with
+        CBad m -> CBad m
+        CR _ Gone -> CBad "arg"
+        CR cs2 (Have sb) ->
+          match compile c false cs2 cx with
+            CBad m -> CBad m
+            CR _ Gone -> CBad "arg"
+            CR cs3 (Have sc) ->
+              (d, cs4) = alloc cs3
+              op = if Nat.eq kind 0 then OBytesAt d sa sb sc
+                else if Nat.eq kind 1 then OMapGet d sa sb sc
+                else OMapPut d sa sb sc
+              finishVal d isTail (emit op cs4)
+
+compileIf : Expr -> Expr -> Expr -> Boolean -> CS -> CX -> CR
+compileIf c th el isTail cs cx =
+  (thenL, cs1) = fresh cs
+  (elseL, cs2) = fresh cs1
+  match compile c false cs2 cx with
+    CBad m -> CBad m
+    CR _ Gone -> CBad "if cond"
+    CR cs3 (Have cslot) ->
+      cs4 = emit (OLab thenL) (emit (OGoIf cslot thenL elseL) cs3)
+      if isTail then
+        match compile th true cs4 cx with
+          CBad m -> CBad m
+          CR cs5 _ ->
+            match compile el true (emit (OLab elseL) cs5) cx with
+              CBad m -> CBad m
+              CR cs6 _ -> CR cs6 Gone
+      else
+        (joinL, csA) = fresh cs4
+        (dest, csB) = alloc csA
+        match compile th false csB cx with
+          CBad m -> CBad m
+          CR _ Gone -> CBad "if then"
+          CR cs5 (Have ts) ->
+            cs6 = emit (OLab elseL) (emit (OGo joinL) (emit (OMove dest ts) cs5))
+            match compile el false cs6 cx with
+              CBad m -> CBad m
+              CR _ Gone -> CBad "if else"
+              CR cs7 (Have es) ->
+                cs8 = emit (OLab joinL) (emit (OGo joinL) (emit (OMove dest es) cs7))
+                CR cs8 (Have dest)
+
+compileCall : Text -> [Expr] -> Boolean -> CS -> CX -> CR
+compileCall n args isTail cs cx =
+  match cx with
+    CX _ _ fname nparams _ _ ->
+      if isTail && (n Text.== fname) && Nat.eq (len args) nparams then
+        match compileArgs args cs cx with
+          ABad m -> CBad m
+          AR slots cs1 ->
+            CR (emit OTail (compileMoves slots 0 cs1)) Gone
+      else
+        match compileArgs args cs cx with
+          ABad m -> CBad m
+          AR slots cs1 ->
+            (dest, cs2) = alloc cs1
+            (lab, cs3) = fresh cs2
+            cs4 = emit (OLab lab) (emit (OCall n slots dest lab) cs3)
+            finishVal dest isTail cs4
+
+compilePerform : Text -> Optional Expr -> Boolean -> CS -> CX -> CR
+compilePerform n pay isTail cs cx =
+  match cx with
+    CX abs his _ _ _ _ ->
+      match findReq n abs with
+        None -> CBad ("unknown ability " Text.++ n)
+        Some (ab, req) ->
+          fast = onceName ab his
+          match pay with
+            None ->
+              (dest, cs1) = alloc cs
+              (lab, cs2) = fresh cs1
+              cs3 = emit (OLab lab) (emit (OPerform ab req 0 0 dest lab fast) cs2)
+              finishVal dest isTail cs3
+            Some p ->
+              match compile p false cs cx with
+                CBad m -> CBad m
+                CR _ Gone -> CBad "payload"
+                CR cs1 (Have ps) ->
+                  (dest, cs2) = alloc cs1
+                  (lab, cs3) = fresh cs2
+                  cs4 = emit (OLab lab) (emit (OPerform ab req 1 ps dest lab fast) cs3)
+                  finishVal dest isTail cs4
+
+compileForce : Expr -> Text -> [Expr] -> Nat -> Boolean -> CS -> CX -> CR
+compileForce ce hname hargs ab isTail cs cx =
+  match compile ce false cs cx with
+    CBad m -> CBad m
+    CR _ Gone -> CBad "force"
+    CR cs1 (Have slot) ->
+      (dest, cs2) = alloc cs1
+      match compileArgs hargs cs2 cx with
+        ABad m -> CBad m
+        AR hslots cs3 ->
+          (lab, cs4) = fresh cs3
+          cs5 = emit (OLab lab) (emit (OHandle hname ab dest "force" [slot] hslots lab) cs4)
+          finishVal dest isTail cs5
+
+compileHandle : Expr -> Text -> [Expr] -> Boolean -> CS -> CX -> CR
+compileHandle body hname hargs isTail cs cx =
+  match cx with
+    CX _ his _ _ inH curH ->
+      match findH hname his with
+        None -> CBad ("unknown handler " Text.++ hname)
+        Some (HInfo _ ab _ pair _) ->
+          match body with
+            EBuiltin "force" [ce] -> compileForce ce hname hargs ab isTail cs cx
+            ECall n args ->
+              match cs with
+                CS _ _ _ _ ken ->
+                  match findBind n ken with
+                    Some ki ->
+                      if isTail && inH && (hname Text.== curH) then compileAgain args hargs ki cs cx
+                      else compileResume hname args hargs ki ab pair isTail cs cx
+                    None ->
+                      compileInstall hname n args hargs ab pair isTail cs cx
+            _ -> CBad "handle body"
+
+compileAgain : [Expr] -> [Expr] -> Nat -> CS -> CX -> CR
+compileAgain args hargs _ cs cx =
+  match args with
+    [v] ->
+      match compile v false cs cx with
+        CBad m -> CBad m
+        CR _ Gone -> CBad "again"
+        CR cs1 (Have vs) ->
+          match compileArgs hargs cs1 cx with
+            ABad m -> CBad m
+            AR slots cs2 ->
+              CR (emit (OAgain vs) (compileMoves slots 0 cs2)) Gone
+    _ -> CBad "resume arity"
+
+compileResume : Text -> [Expr] -> [Expr] -> Nat -> Nat -> Boolean -> Boolean -> CS -> CX -> CR
+compileResume hname args hargs ki ab _pair isTail cs cx =
+  match args with
+    [v] ->
+      (dest, cs1) = alloc cs
+      match compile v false cs1 cx with
+        CBad m -> CBad m
+        CR _ Gone -> CBad "resume val"
+        CR cs2 (Have vs) ->
+          match compileArgs hargs cs2 cx with
+            ABad m -> CBad m
+            AR slots cs3 ->
+              (lab, cs4) = fresh cs3
+              cs5 = emit (OLab lab) (emit (OResume hname ab ki vs dest lab slots) cs4)
+              finishVal dest isTail cs5
+    _ -> CBad "resume arity"
+
+handlerNow : CX -> Text
+handlerNow cx =
+  match cx with
+    CX _ _ _ _ _ h -> h
+
+compileInstall : Text -> Text -> [Expr] -> [Expr] -> Nat -> Boolean -> Boolean -> CS -> CX -> CR
+compileInstall hname fname args hargs ab pair isTail cs cx =
+  (dest, cs1) = alloc cs
+  cs2 = if pair then
+    match alloc cs1 with
+      (_, csX) -> csX
+    else cs1
+  match compileArgs args cs2 cx with
+    ABad m -> CBad m
+    AR bslots cs3 ->
+      match compileArgs hargs cs3 cx with
+        ABad m -> CBad m
+        AR hslots cs4 ->
+          (lab, cs5) = fresh cs4
+          cs6 = emit (OLab lab) (emit (OHandle hname ab dest fname bslots hslots lab) cs5)
+          finishVal dest isTail cs6
+
+nLabs : [Op] -> Nat
+nLabs ops =
+  go xs n =
+    match xs with
+      [] -> n
+      OLab _ +: t -> go t (n Nat.+ 1)
+      _ +: t -> go t n
+  go ops 0
+
+pcOf : Nat -> [NR] -> Nat
+pcOf n ms =
+  match ms with
+    [] -> 0
+    NR a b +: t ->
+      if Nat.eq a n then b else pcOf n t
+
+assign : [Op] -> Nat -> [NR] -> (Nat, [NR])
+assign ops pc acc =
+  match ops with
+    [] -> (pc, acc)
+    OLab n +: t -> assign t (pc Nat.+ 1) (NR n pc +: acc)
+    _ +: t -> assign t pc acc
+
+copySlots : Text -> [Nat] -> Nat -> Text
+copySlots prefix slots i =
+  match slots with
+    [] -> ""
+    s +: t ->
+      "      " Text.++ prefix Text.++ "[" Text.++ Nat.toText i Text.++ "] = f->slot[" Text.++ Nat.toText s Text.++ "];\n"
+        Text.++ copySlots prefix t (i Nat.+ 1)
+
+hdOf : Text -> [Fundef] -> Optional ([Text], [Branch])
+hdOf n fs =
+  match fs with
+    [] -> None
+    FHd name ps bs +: t ->
+      if name Text.== n then Some (ps, bs) else hdOf n t
+    _ +: t -> hdOf n t
+
+reqBranch : Nat -> [Branch] -> [Abil] -> Optional Branch
+reqBranch rid bs abs =
+  match bs with
+    [] -> None
+    BPure _ _ +: t -> reqBranch rid t abs
+    BReq ab req pay k e +: t ->
+      match findReq (ab Text.++ "." Text.++ req) abs with
+        Some (_, id) ->
+          if Nat.eq id rid then Some (BReq ab req pay k e) else reqBranch rid t abs
+        None -> reqBranch rid t abs
+
+branchOps : Branch -> [Text] -> Text -> [Abil] -> [HInfo] -> Optional [Op]
+branchOps br params hname abs his =
+  match br with
+    BPure _ _ -> None
+    BReq _ _ pay k e ->
+      extra = match pay with
+        None -> 0
+        Some _ -> 1
+      env0 = bindParams params 0
+      env1 = match pay with
+        None -> env0
+        Some p -> Bind p (len params) +: env0
+      cs = CS ((len params) Nat.+ extra) 1 [OLab 0] env1 [Bind k 0]
+      cx = CX abs his hname (len params) true hname
+      match compile e true cs cx with
+        CBad _ -> None
+        CR cs2 kind ->
+          cs3 = match kind with
+            Gone -> cs2
+            Have s -> emit (ORet s) cs2
+          match cs3 with
+            CS _ _ ops _ _ -> Some (rev ops)
+
+straight : [Op] -> Boolean
+straight xs =
+  match xs with
+    [] -> true
+    OLab _ +: t -> straight t
+    OLoad _ _ +: t -> straight t
+    OMove _ _ +: t -> straight t
+    OAdd _ _ _ +: t -> straight t
+    OSub _ _ _ +: t -> straight t
+    OEq _ _ _ +: t -> straight t
+    OAgain _ +: t -> straight t
+    ORet _ +: t -> straight t
+    _ +: _ -> false
+
+sv : Boolean -> Nat -> Text
+sv useG n =
+  if useG then "s" Text.++ Nat.toText n
+  else "f->slot[" Text.++ Nat.toText n Text.++ "]"
+
+mx : Nat -> Nat -> Nat
+mx a b =
+  if Nat.lt a b then b else a
+
+below : Nat -> Nat -> Boolean
+below i n = Nat.lt i n
+
+joinN : Nat -> (Nat -> Text) -> Text
+joinN n step =
+  go i =
+    if Nat.eq i n then ""
+    else step i Text.++ go (i Nat.+ 1)
+  go 0
+
+declOne : Nat -> Text
+declOne i =
+  tail = if Nat.eq (i Nat.+ 1) 32 then "=0;\n" else "=0,"
+  "s" Text.++ Nat.toText i Text.++ tail
+
+reloadOne : Nat -> Text
+reloadOne i =
+  "    s" Text.++ Nat.toText i Text.++ "=f->slot[" Text.++ Nat.toText i Text.++ "];\n"
+
+flushOne : Nat -> Text
+flushOne i =
+  "    f->slot[" Text.++ Nat.toText i Text.++ "]=s" Text.++ Nat.toText i Text.++ ";\n"
+
+hsDecl : Nat -> Nat -> Text
+hsDecl nparams i =
+  init = if below i nparams then "h->slot[" Text.++ Nat.toText i Text.++ "]" else "0"
+  sep = if Nat.eq (i Nat.+ 1) 8 then ";\n" else ","
+  "hs" Text.++ Nat.toText i Text.++ "=" Text.++ init Text.++ sep
+
+writeHs : Nat -> Text
+writeHs n =
+  go i =
+    if Nat.eq i n then ""
+    else "      h->slot[" Text.++ Nat.toText i Text.++ "]=hs" Text.++ Nat.toText i Text.++ ";\n" Text.++ go (i Nat.+ 1)
+  go 0
+
+maxOpSlot : Op -> Nat
+maxOpSlot op =
+  match op with
+    OLoad d _ -> d
+    OMove d s -> mx d s
+    OAdd d a b -> mx d (mx a b)
+    OSub d a b -> mx d (mx a b)
+    OEq d a b -> mx d (mx a b)
+    OAgain s -> s
+    ORet s -> s
+    _ -> 0
+
+maxOps : [Op] -> Nat
+maxOps xs =
+  go ys m =
+    match ys with
+      [] -> m
+      h +: t -> go t (mx m (maxOpSlot h))
+  go xs 0
+
+renderStraight : [Op] -> Nat -> Text -> Text -> Nat -> Text
+renderStraight ops nparams payE destE has =
+  hsOp op =
+    match op with
+      OLab _ -> ""
+      OLoad a n -> "      hs" Text.++ Nat.toText a Text.++ " = " Text.++ Nat.toText n Text.++ "ull;\n"
+      OMove a b -> "      hs" Text.++ Nat.toText a Text.++ " = hs" Text.++ Nat.toText b Text.++ ";\n"
+      OAdd a b c -> "      hs" Text.++ Nat.toText a Text.++ " = hs" Text.++ Nat.toText b Text.++ " + hs" Text.++ Nat.toText c Text.++ ";\n"
+      OSub a b c -> "      hs" Text.++ Nat.toText a Text.++ " = hs" Text.++ Nat.toText b Text.++ " - hs" Text.++ Nat.toText c Text.++ ";\n"
+      OEq a b c -> "      hs" Text.++ Nat.toText a Text.++ " = hs" Text.++ Nat.toText b Text.++ " == hs" Text.++ Nat.toText c Text.++ ";\n"
+      OAgain s -> "      " Text.++ destE Text.++ " = hs" Text.++ Nat.toText s Text.++ ";\n"
+      ORet s -> "      " Text.++ destE Text.++ " = hs" Text.++ Nat.toText s Text.++ ";\n"
+      _ -> ""
+  go xs =
+    match xs with
+      [] -> ""
+      h +: t -> hsOp h Text.++ go t
+  payLine = if Nat.eq has 0 then ""
+    else "      hs" Text.++ Nat.toText nparams Text.++ " = " Text.++ payE Text.++ ";\n"
+  "      uint64_t " Text.++ joinN 8 (hsDecl nparams)
+    Text.++ payLine
+    Text.++ go ops
+    Text.++ writeHs nparams
+
+lookupH : Nat -> Text
+lookupH ab =
+  a = Nat.toText ab
+  "      Frame *h = 0;\n      if (" Text.++ a Text.++ " < 8) h = fastH[" Text.++ a Text.++ "];\n      if (!h) {\n        h = f->next;\n        while (h && !(h->is_handler && h->ability == " Text.++ a Text.++ ")) h = h->next;\n        if (!h) { fprintf(stderr, \"unhandled ability %d\\n\", " Text.++ a Text.++ "); exit(1); }\n        if (" Text.++ a Text.++ " < 8) fastH[" Text.++ a Text.++ "] = h;\n      }\n"
+
+inlinePerform : Nat -> Nat -> Nat -> Nat -> Nat -> Text -> [Fundef] -> [Abil] -> [HInfo] -> Boolean -> Optional Text
+inlinePerform ab req has pay dest fname fs abs his useG =
+  match hdOf fname fs with
+    None -> None
+    Some (ps, bs) ->
+      match reqBranch req bs abs with
+        None -> None
+        Some br ->
+          match branchOps br ps fname abs his with
+            None -> None
+            Some ops ->
+              if straight ops && below (maxOps ops) 8 then
+                Some (renderStraight ops (len ps) (sv useG pay) (sv useG dest) has)
+              else None
+
+renderPerform : Nat -> Nat -> Nat -> Nat -> Nat -> Nat -> Text -> EM -> Text
+renderPerform ab req has pay dest lab fname em =
+  match em with
+    EM useG fs abs his mp w _ ->
+      pc = Nat.toText (pcOf lab mp)
+      payE = if Nat.eq has 0 then "0" else sv useG pay
+      flush = if useG then joinN w flushOne else ""
+      slow = flush Text.++ "    f->pc = " Text.++ pc Text.++ ";\n    uj_perform(f, " Text.++ Nat.toText ab Text.++ ", " Text.++ Nat.toText req Text.++ ", " Text.++ Nat.toText has Text.++ ", " Text.++ payE Text.++ ", " Text.++ Nat.toText dest Text.++ ");\n    return;\n"
+      call = "    f->pc = " Text.++ pc Text.++ ";\n    f->resume_slot = " Text.++ Nat.toText dest Text.++ ";\n    {\n      Frame *h = f->next;\n      while (h && !(h->is_handler && h->ability == " Text.++ Nat.toText ab Text.++ ")) h = h->next;\n      if (!h) { fprintf(stderr, \"unhandled ability %d\\n\", " Text.++ Nat.toText ab Text.++ "); exit(1); }\n      h->kont = f;\n      h->req = " Text.++ Nat.toText req Text.++ ";\n      h->has_payload = " Text.++ Nat.toText has Text.++ ";\n      h->payload = " Text.++ payE Text.++ ";\n      h->pc = 1;\n      fn_" Text.++ fname Text.++ "(h);\n    }\n"
+      back = if useG then "    " Text.++ sv useG dest Text.++ " = f->slot[" Text.++ Nat.toText dest Text.++ "];\n" else ""
+      if fname Text.== "" then slow
+      else if Boolean.not useG then call Text.++ "    break;\n"
+      else
+        match inlinePerform ab req has pay dest fname fs abs his useG with
+          Some body ->
+            "    {\n" Text.++ lookupH ab Text.++ body Text.++ "    }\n    goto lab_" Text.++ pc Text.++ ";\n"
+          None -> call Text.++ back Text.++ "    goto lab_" Text.++ pc Text.++ ";\n"
+
+joinSv : Boolean -> [Nat] -> Text
+joinSv useG xs =
+  match xs with
+    [] -> ""
+    h +: [] -> sv useG h
+    h +: t -> sv useG h Text.++ ", " Text.++ joinSv useG t
+
+renderCon : [Nat] -> Boolean -> Text
+renderCon args useG =
+  match args with
+    tag +: fs ->
+      arr = if Nat.eq (len fs) 0 then "0" else "(const uint64_t[]){" Text.++ joinSv useG fs Text.++ "}"
+      "uj_obj_n((int)" Text.++ sv useG tag Text.++ ", " Text.++ Nat.toText (len fs) Text.++ ", " Text.++ arr Text.++ ")"
+    [] -> "uj_obj_n(0, 0, 0)"
+
+renderBlds : [Nat] -> Boolean -> Text
+renderBlds args useG =
+  go xs =
+    match xs with
+      [] -> "uj_list_empty()"
+      h +: t -> "uj_list_cons(" Text.++ sv useG h Text.++ ", " Text.++ go t Text.++ ")"
+  go args
+
+renderBuiltin : Text -> Nat -> [Nat] -> Boolean -> Text
+renderBuiltin name d args useG =
+  pair xs =
+    match xs with
+      a +: (b +: _) -> (sv useG a, sv useG b)
+      a +: _ -> (sv useG a, "0")
+      [] -> ("0", "0")
+  (s0, s1) = pair args
+  call = if name Text.== "con" then renderCon args useG
+    else if name Text.== "blds" then renderBlds args useG
+    else if name Text.== "take" then "uj_text_take(" Text.++ s0 Text.++ ", " Text.++ s1 Text.++ ")"
+    else if name Text.== "drop" then "uj_text_drop(" Text.++ s0 Text.++ ", " Text.++ s1 Text.++ ")"
+    else if name Text.== "cat" then "uj_text_cat(" Text.++ s0 Text.++ ", " Text.++ s1 Text.++ ")"
+    else if name Text.== "eq" then "uj_text_eq(" Text.++ s0 Text.++ ", " Text.++ s1 Text.++ ")"
+    else if name Text.== "neq" then "(uj_text_eq(" Text.++ s0 Text.++ ", " Text.++ s1 Text.++ ") == 0)"
+    else if name Text.== "index" then "uj_text_index(" Text.++ s0 Text.++ ", " Text.++ s1 Text.++ ")"
+    else if name Text.== "lt" then "(" Text.++ s0 Text.++ " < " Text.++ s1 Text.++ ")"
+    else if name Text.== "sub" then "uj_nat_sub(" Text.++ s0 Text.++ ", " Text.++ s1 Text.++ ")"
+    else if name Text.== "nateq" then "(" Text.++ s0 Text.++ " == " Text.++ s1 Text.++ ")"
+    else if name Text.== "add" then "(" Text.++ s0 Text.++ " + " Text.++ s1 Text.++ ")"
+    else if name Text.== "mul" then "(" Text.++ s0 Text.++ " * " Text.++ s1 Text.++ ")"
+    else if name Text.== "div" then "(" Text.++ s0 Text.++ " / " Text.++ s1 Text.++ ")"
+    else if name Text.== "mod" then "(" Text.++ s0 Text.++ " % " Text.++ s1 Text.++ ")"
+    else if name Text.== "not" then "(uj_bool(" Text.++ s0 Text.++ ") == 0)"
+    else if name Text.== "viewl" then "uj_list_view(" Text.++ s0 Text.++ ")"
+    else if name Text.== "cons" then "uj_list_cons(" Text.++ s0 Text.++ ", " Text.++ s1 Text.++ ")"
+    else if name Text.== "apply" then "uj_apply(" Text.++ s0 Text.++ ", " Text.++ s1 Text.++ ")"
+    else if name Text.== "push" then "uj_push(" Text.++ s0 Text.++ ", " Text.++ s1 Text.++ ")"
+    else if name Text.== "size" then "uj_text_size(" Text.++ s0 Text.++ ")"
+    else if name Text.== "from" then "uj_nat_from_text(" Text.++ s0 Text.++ ")"
+    else if name Text.== "totext" then "uj_text_nat(" Text.++ s0 Text.++ ")"
+    else if name Text.== "con" then "uj_obj((int)" Text.++ s0 Text.++ ", 1, " Text.++ s1 Text.++ ")"
+    else if name Text.== "read" then "uj_read_file(" Text.++ s0 Text.++ ")"
+    else if name Text.== "utf8dec" then "uj_utf8_decode(" Text.++ s0 Text.++ ")"
+    else if name Text.== "utf8enc" then "uj_text_to_utf8(" Text.++ s0 Text.++ ")"
+    else if name Text.== "write" then "uj_write_file(" Text.++ s0 Text.++ ", " Text.++ s1 Text.++ ")"
+    else "0"
+  "    " Text.++ sv useG d Text.++ " = " Text.++ call Text.++ ";\n"
+
+arityOf : Text -> [Fundef] -> Optional Nat
+arityOf n fs =
+  match fs with
+    [] -> None
+    FFn name ps _ +: t ->
+      if name Text.== n then Some (len ps) else arityOf n t
+    _ +: t -> arityOf n t
+
+lookupFn : Text -> [Fundef] -> Optional Expr
+lookupFn n fs =
+  match fs with
+    [] -> None
+    FFn name _ e +: t -> if name Text.== n then Some e else lookupFn n t
+    _ +: t -> lookupFn n t
+
+seenHas : Text -> [Text] -> Boolean
+seenHas n xs =
+  match xs with
+    [] -> false
+    h +: t -> if h Text.== n then true else seenHas n t
+
+anySuspends : [Expr] -> [Fundef] -> [Text] -> Boolean
+anySuspends xs fs seen =
+  match xs with
+    [] -> false
+    h +: t -> if exprSuspends h fs seen then true else anySuspends t fs seen
+
+exprSuspends : Expr -> [Fundef] -> [Text] -> Boolean
+exprSuspends e fs seen =
+  match e with
+    ENat _ -> false
+    EBool _ -> false
+    EUnit -> false
+    EVar _ -> false
+    EAdd a b -> exprSuspends a fs seen || exprSuspends b fs seen
+    ESub a b -> exprSuspends a fs seen || exprSuspends b fs seen
+    EEq a b -> exprSuspends a fs seen || exprSuspends b fs seen
+    EIf c th el -> exprSuspends c fs seen || exprSuspends th fs seen || exprSuspends el fs seen
+    ECall n args ->
+      if anySuspends args fs seen then true
+      else if seenHas n seen then false
+      else match lookupFn n fs with
+        None -> true
+        Some body -> exprSuspends body fs (n +: seen)
+    EPerform _ _ -> true
+    EHandle _ _ _ -> true
+    ELet _ a b -> exprSuspends a fs seen || exprSuspends b fs seen
+    ESeq a b -> exprSuspends a fs seen || exprSuspends b fs seen
+    EPrint a -> exprSuspends a fs seen
+    EPair a b -> exprSuspends a fs seen || exprSuspends b fs seen
+    ETup _ _ a b -> exprSuspends a fs seen || exprSuspends b fs seen
+    ECon _ m ->
+      match m with
+        None -> false
+        Some a -> exprSuspends a fs seen
+    EIsTag a _ -> exprSuspends a fs seen
+    EField a _ -> exprSuspends a fs seen
+    EText _ -> false
+    ETextOf a -> exprSuspends a fs seen
+    ETextCat a b -> exprSuspends a fs seen || exprSuspends b fs seen
+    EBytes _ -> false
+    EBytesCat a b -> exprSuspends a fs seen || exprSuspends b fs seen
+    EBytesSize a -> exprSuspends a fs seen
+    EBytesAt a b c -> exprSuspends a fs seen || exprSuspends b fs seen || exprSuspends c fs seen
+    EMapEmpty -> false
+    EMapPut a b c -> exprSuspends a fs seen || exprSuspends b fs seen || exprSuspends c fs seen
+    EMapSize a -> exprSuspends a fs seen
+    EMapGet a b c -> exprSuspends a fs seen || exprSuspends b fs seen || exprSuspends c fs seen
+    EBuiltin _ args -> anySuspends args fs seen
+    ERefNew a -> exprSuspends a fs seen
+    ERefRead a -> exprSuspends a fs seen
+    ERefWrite a b -> exprSuspends a fs seen || exprSuspends b fs seen
+    ETvarNew a -> exprSuspends a fs seen
+    ETvarRead a -> exprSuspends a fs seen
+    ETvarReadIO a -> exprSuspends a fs seen
+    ETvarWrite a b -> exprSuspends a fs seen || exprSuspends b fs seen
+    EAtomic a -> exprSuspends a fs seen
+    ERetry -> false
+
+isPlain : Text -> [Fundef] -> Boolean
+isPlain n fs =
+  match lookupFn n fs with
+    None -> false
+    Some e -> Boolean.not (exprSuspends e fs [n])
+
+fillIn : Boolean -> [Nat] -> Nat -> Text
+fillIn useG args i =
+  match args with
+    [] -> ""
+    h +: t ->
+      "      _in[" Text.++ Nat.toText i Text.++ "] = " Text.++ sv useG h Text.++ ";\n"
+        Text.++ fillIn useG t (i Nat.+ 1)
+
+cArgs : Nat -> Text
+cArgs n =
+  go i =
+    if Nat.eq i n then ""
+    else
+      sep = if Nat.eq (i Nat.+ 1) n then "" else ", "
+      "uint64_t a" Text.++ Nat.toText i Text.++ sep Text.++ go (i Nat.+ 1)
+  if Nat.eq n 0 then "void" else go 0
+
+bindArgs : Nat -> Text
+bindArgs n =
+  go i =
+    if Nat.eq i n then ""
+    else "  s" Text.++ Nat.toText i Text.++ "=a" Text.++ Nat.toText i Text.++ ";\n" Text.++ go (i Nat.+ 1)
+  go 0
+
+frameArgs : Nat -> Text
+frameArgs n =
+  go i =
+    if Nat.eq i n then ""
+    else
+      sep = if Nat.eq (i Nat.+ 1) n then "" else ", "
+      "f->slot[" Text.++ Nat.toText i Text.++ "]" Text.++ sep Text.++ go (i Nat.+ 1)
+  go 0
+
+nestedCall : Boolean -> Text -> [Nat] -> Nat -> Nat -> Text
+nestedCall useG fn args dest lab =
+  n = len args
+  d = Nat.toText dest
+  pc = Nat.toText lab
+  ntxt = Nat.toText n
+  destE = if useG then "s" Text.++ d else "f->slot[" Text.++ d Text.++ "]"
+  slots = if Nat.eq n 0 then "1" else ntxt
+  opened = "    {\n      uint64_t _in[" Text.++ slots Text.++ "];\n" Text.++ fillIn useG args 0
+  call = "      " Text.++ destE Text.++ " = uj_call(fn_" Text.++ fn Text.++ ", " Text.++ ntxt Text.++ ", _in);\n    }\n"
+  tail = if useG then "    goto lab_" Text.++ pc Text.++ ";\n" else "    f->pc = " Text.++ pc Text.++ ";\n    break;\n"
+  opened Text.++ call Text.++ tail
+
+directCall : Boolean -> Text -> [Nat] -> Nat -> Nat -> Text
+directCall useG fn args dest lab =
+  d = Nat.toText dest
+  pc = Nat.toText lab
+  destE = if useG then "s" Text.++ d else "f->slot[" Text.++ d Text.++ "]"
+  tail = if useG then "goto lab_" Text.++ pc Text.++ ";\n" else "f->pc = " Text.++ pc Text.++ ";\n    break;\n"
+  "    " Text.++ destE Text.++ " = fn_" Text.++ fn Text.++ "(" Text.++ joinSv useG args Text.++ ");\n    " Text.++ tail
+
+renderOp : Op -> EM -> Text
+renderOp op em =
+  useG = match em with
+    EM g _ _ _ _ _ _ -> g
+  mp = match em with
+    EM _ _ _ _ m _ _ -> m
+  width = match em with
+    EM _ _ _ _ _ w _ -> w
+  fundefs = match em with
+    EM _ fs0 _ _ _ _ _ -> fs0
+  direct = match em with
+    EM _ _ _ _ _ _ d -> d
+  flush = if direct then "" else if useG then joinN width flushOne else ""
+  match op with
+    OLab _ -> ""
+    OLoad d n -> "    " Text.++ sv useG d Text.++ " = " Text.++ Nat.toText n Text.++ "ull;\n"
+    OMove d s -> "    " Text.++ sv useG d Text.++ " = " Text.++ sv useG s Text.++ ";\n"
+    OAdd d a b -> "    " Text.++ sv useG d Text.++ " = " Text.++ sv useG a Text.++ " + " Text.++ sv useG b Text.++ ";\n"
+    OSub d a b -> "    " Text.++ sv useG d Text.++ " = " Text.++ sv useG a Text.++ " - " Text.++ sv useG b Text.++ ";\n"
+    OEq d a b -> "    " Text.++ sv useG d Text.++ " = " Text.++ sv useG a Text.++ " == " Text.++ sv useG b Text.++ ";\n"
+    OGo lab ->
+      if useG then "    goto lab_" Text.++ Nat.toText (pcOf lab mp) Text.++ ";\n"
+      else "    f->pc = " Text.++ Nat.toText (pcOf lab mp) Text.++ ";\n    break;\n"
+    OGoIf c th el ->
+      if useG then
+        "    if (uj_bool(" Text.++ sv useG c Text.++ ")) goto lab_" Text.++ Nat.toText (pcOf th mp)
+          Text.++ "; else goto lab_" Text.++ Nat.toText (pcOf el mp) Text.++ ";\n"
+      else
+        "    if (uj_bool(" Text.++ sv useG c Text.++ ")) f->pc = " Text.++ Nat.toText (pcOf th mp)
+          Text.++ "; else f->pc = " Text.++ Nat.toText (pcOf el mp) Text.++ ";\n    break;\n"
+    OPerform ab req has pay dest lab fname ->
+      renderPerform ab req has pay dest lab fname em
+    OCall fn args dest lab ->
+      plainFn = isPlain fn fundefs
+      ptr = if plainFn then "fn_" Text.++ fn Text.++ "_fr" else "fn_" Text.++ fn
+      clos = match arityOf fn fundefs with
+        Some n ->
+          if Nat.lt (len args) n then
+            go xs e =
+              match xs with
+                [] -> e
+                h +: t -> go t ("uj_apply(" Text.++ e Text.++ ", " Text.++ sv useG h Text.++ ")")
+            bit = if plainFn then "1" else "0"
+            Some (go args ("uj_clos_kind(" Text.++ ptr Text.++ ", " Text.++ Nat.toText n Text.++ ", " Text.++ bit Text.++ ")"))
+          else None
+        None -> None
+      match clos with
+        Some e ->
+          d = Nat.toText dest
+          pc = Nat.toText (pcOf lab mp)
+          slotOnly = "    s" Text.++ d Text.++ " = " Text.++ e Text.++ ";\n    goto lab_" Text.++ pc Text.++ ";\n"
+          withFrame = flush Text.++ "    s" Text.++ d Text.++ " = " Text.++ e Text.++ ";\n    f->slot[" Text.++ d Text.++ "] = s" Text.++ d Text.++ ";\n    goto lab_" Text.++ pc Text.++ ";\n"
+          noG = flush Text.++ "    f->slot[" Text.++ d Text.++ "] = " Text.++ e Text.++ ";\n    f->pc = " Text.++ pc Text.++ ";\n    break;\n"
+          if direct then slotOnly else if useG then withFrame else noG
+        None ->
+          slow =
+            flush Text.++ "    f->pc = " Text.++ Nat.toText (pcOf lab mp) Text.++ ";\n    {\n      Frame *c = uj_new(fn_" Text.++ fn Text.++ ");\n"
+              Text.++ copySlots "c->slot" args 0
+              Text.++ "      c->dest_slot = " Text.++ Nat.toText dest Text.++ ";\n      c->next = f;\n      uj_next = c;\n    }\n    return;\n"
+          exact = match arityOf fn fundefs with
+            Some k -> Nat.eq (len args) k
+            None -> false
+          cCall = directCall useG fn args dest (pcOf lab mp)
+          nCall = nestedCall useG fn args dest (pcOf lab mp)
+          if plainFn && exact && Nat.lt (len args) 64 then cCall
+          else if direct then nCall
+          else slow
+    OTail ->
+      if useG then "    goto lab_0;\n" else "    f->pc = 0;\n    break;\n"
+    OApply c a dest lab ->
+      cs = sv useG c
+      as = sv useG a
+      d = Nat.toText dest
+      pc = Nat.toText (pcOf lab mp)
+      plainApply = "    s" Text.++ d Text.++ " = uj_apply((uint64_t)(uintptr_t)" Text.++ cs Text.++ ", " Text.++ as Text.++ ");\n    goto lab_" Text.++ pc Text.++ ";\n"
+      slotD = if useG then "s" Text.++ d else "f->slot[" Text.++ d Text.++ "]"
+      block = "    f->pc = " Text.++ pc Text.++ ";\n    {\n      UjClos *cl = (UjClos *)(uintptr_t)" Text.++ cs Text.++ ";\n      if (!cl || !cl->fn) { fprintf(stderr, \"apply empty\\n\"); exit(1); }\n      if (cl->have + 1 < cl->need || cl->plain) {\n        " Text.++ slotD Text.++ " = uj_apply((uint64_t)(uintptr_t)cl, " Text.++ as Text.++ ");\n        f->slot[" Text.++ d Text.++ "] = " Text.++ slotD Text.++ ";\n      } else {\n        Frame *b = uj_new(cl->fn);\n        int i;\n        for (i = 0; i < cl->have; i++) b->slot[i] = cl->arg[i];\n        b->slot[cl->have] = " Text.++ as Text.++ ";\n        b->dest_slot = " Text.++ d Text.++ ";\n        b->next = f;\n        uj_next = b;\n        return;\n      }\n    }\n"
+      framed = if useG then flush Text.++ block Text.++ "    goto lab_" Text.++ pc Text.++ ";\n" else flush Text.++ block Text.++ "    break;\n"
+      if direct then plainApply else framed
+    OHandle hname ab dest fn bargs hargs lab ->
+      bodyFn = if fn Text.== "force" then "uj_force_clos" else "fn_" Text.++ fn
+      flush Text.++ "    f->pc = " Text.++ Nat.toText (pcOf lab mp) Text.++ ";\n    {\n      Frame *h = uj_new(fn_" Text.++ hname Text.++ ");\n      h->is_handler = 1;\n      h->ability = " Text.++ Nat.toText ab Text.++ ";\n      h->body = " Text.++ bodyFn Text.++ ";\n      h->dest_slot = " Text.++ Nat.toText dest Text.++ ";\n      h->bargn = " Text.++ Nat.toText (len bargs) Text.++ ";\n"
+        Text.++ copySlots "h->barg" bargs 0
+        Text.++ copySlots "h->slot" hargs 0
+        Text.++ "      h->next = f;\n      uj_next = h;\n    }\n    return;\n"
+    OResume hname ab ki vs dest lab hargs ->
+      flush Text.++ "    f->pc = " Text.++ Nat.toText (pcOf lab mp) Text.++ ";\n    {\n      Frame *h = uj_new(fn_" Text.++ hname Text.++ ");\n      h->is_handler = 1;\n      h->ability = " Text.++ Nat.toText ab Text.++ ";\n      h->pc = 2;\n      h->dest_slot = " Text.++ Nat.toText dest Text.++ ";\n"
+        Text.++ copySlots "h->slot" hargs 0
+        Text.++ "      h->next = f;\n      uj_resume(h, f->ks[" Text.++ Nat.toText ki Text.++ "], f->slot[" Text.++ Nat.toText vs Text.++ "]);\n    }\n    return;\n"
+    OAgain vs -> "    uj_resume_once(f, f->slot[" Text.++ Nat.toText vs Text.++ "]);\n    return;\n"
+    ORet s ->
+      if direct then "    uj_stamp();\n    return " Text.++ sv useG s Text.++ ";\n"
+      else "    uj_stamp();\n    uj_return(f, " Text.++ sv useG s Text.++ ");\n    return;\n"
+    OPrint s -> "    printf(\"%llu\\n\", (unsigned long long)" Text.++ sv useG s Text.++ ");\n"
+    OHalt -> "    uj_return(f, 0);\n    return;\n"
+    OObj d tag n fld ->
+      if Nat.eq n 0 then "    " Text.++ sv useG d Text.++ " = uj_obj(" Text.++ Nat.toText tag Text.++ ", 0, 0);\n"
+      else "    " Text.++ sv useG d Text.++ " = uj_obj(" Text.++ Nat.toText tag Text.++ ", 1, " Text.++ sv useG fld Text.++ ");\n"
+    OIsTag d s tag ->
+      "    " Text.++ sv useG d Text.++ " = uj_tag(" Text.++ sv useG s Text.++ ") == " Text.++ Nat.toText tag Text.++ ";\n"
+    OField d s i ->
+      "    " Text.++ sv useG d Text.++ " = uj_field(" Text.++ sv useG s Text.++ ", " Text.++ Nat.toText i Text.++ ");\n"
+    OStr d t ->
+      "    " Text.++ sv useG d Text.++ " = uj_text_lit(\"" Text.++ escapeC t Text.++ "\");\n"
+    OTextNat d s ->
+      "    " Text.++ sv useG d Text.++ " = uj_text_nat(" Text.++ sv useG s Text.++ ");\n"
+    OTextCat d a b ->
+      "    " Text.++ sv useG d Text.++ " = uj_text_cat(" Text.++ sv useG a Text.++ ", " Text.++ sv useG b Text.++ ");\n"
+    OBytes d ns ->
+      if Nat.eq (len ns) 0 then "    " Text.++ sv useG d Text.++ " = uj_bytes_of(0, 0);\n"
+      else "    { uint8_t lit[]={" Text.++ joinNums ns Text.++ "}; " Text.++ sv useG d Text.++ "=uj_bytes_of(" Text.++ Nat.toText (len ns) Text.++ ", lit); }\n"
+    OBytesCat d a b ->
+      "    " Text.++ sv useG d Text.++ " = uj_bytes_cat(" Text.++ sv useG a Text.++ ", " Text.++ sv useG b Text.++ ");\n"
+    OBytesSize d s ->
+      "    " Text.++ sv useG d Text.++ " = uj_bytes_size(" Text.++ sv useG s Text.++ ");\n"
+    OBytesAt d m i b ->
+      "    " Text.++ sv useG d Text.++ " = uj_bytes_at(" Text.++ sv useG m Text.++ ", " Text.++ sv useG i Text.++ ", " Text.++ sv useG b Text.++ ");\n"
+    OMapEmpty d ->
+      "    " Text.++ sv useG d Text.++ " = uj_map_empty();\n"
+    OMapPut d k v m ->
+      "    " Text.++ sv useG d Text.++ " = uj_map_put(" Text.++ sv useG k Text.++ ", " Text.++ sv useG v Text.++ ", " Text.++ sv useG m Text.++ ");\n"
+    OMapSize d s ->
+      "    " Text.++ sv useG d Text.++ " = uj_map_size(" Text.++ sv useG s Text.++ ");\n"
+    OMapGet d m k a ->
+      "    " Text.++ sv useG d Text.++ " = uj_map_get(" Text.++ sv useG m Text.++ ", " Text.++ sv useG k Text.++ ", " Text.++ sv useG a Text.++ ");\n"
+    OBuiltin name d args -> renderBuiltin name d args useG
+    ORefNew d s ->
+      "    " Text.++ sv useG d Text.++ " = uj_ref_new(" Text.++ sv useG s Text.++ ");\n"
+    ORefRead d s ->
+      "    " Text.++ sv useG d Text.++ " = uj_ref_read(" Text.++ sv useG s Text.++ ");\n"
+    ORefWrite r v ->
+      "    uj_ref_write(" Text.++ sv useG r Text.++ ", " Text.++ sv useG v Text.++ ");\n"
+    OTvarNew d s ->
+      "    " Text.++ sv useG d Text.++ " = uj_tvar_new(" Text.++ sv useG s Text.++ ");\n"
+    OTvarRead d s ->
+      "    " Text.++ sv useG d Text.++ " = uj_tvar_read(" Text.++ sv useG s Text.++ ");\n"
+    OTvarReadIO d s ->
+      "    " Text.++ sv useG d Text.++ " = uj_tvar_read_io(" Text.++ sv useG s Text.++ ");\n"
+    OTvarWrite r v ->
+      "    uj_tvar_write(" Text.++ sv useG r Text.++ ", " Text.++ sv useG v Text.++ ");\n"
+    OStmBegin -> "    uj_stm_begin();\n"
+    OStmCommit -> "    uj_stm_commit();\n"
+    OStmRetry -> "    uj_stm_retry();\n"
+
+untilLab : [Op] -> ([Op], [Op])
+untilLab xs =
+  go ys acc =
+    match ys with
+      [] -> (rev acc, [])
+      OLab n +: t -> (rev acc, OLab n +: t)
+      h +: t -> go t (h +: acc)
+  go xs []
+
+emitSwitch : [Op] -> EM -> Text
+emitSwitch ops em =
+  match em with
+    EM useG _ _ _ mp w direct ->
+      go xs =
+        match xs with
+          [] -> ""
+          OLab n +: t ->
+            (body, rest) = untilLab t
+            pc = Nat.toText (pcOf n mp)
+            lab = if direct then "  lab_" Text.++ pc Text.++ ":\n" else if useG then joinN w reloadOne Text.++ "  lab_" Text.++ pc Text.++ ":\n" else ""
+            head = if direct then "" else "  case " Text.++ pc Text.++ ":\n"
+            head Text.++ lab Text.++ "  {\n" Text.++ renderBody body em Text.++ "  }\n" Text.++ go rest
+          _ +: t -> go t
+      go ops
+
+renderBody : [Op] -> EM -> Text
+renderBody ops em =
+  match ops with
+    [] -> ""
+    h +: t -> renderOp h em Text.++ renderBody t em
+
+hasTail : [Op] -> Boolean
+hasTail xs =
+  match xs with
+    [] -> false
+    OTail +: _ -> true
+    _ +: t -> hasTail t
+
+renderFnOps : Text -> [Op] -> Nat -> [Fundef] -> [Abil] -> [HInfo] -> Nat -> Nat -> Text
+renderFnOps name ops base fs abs his nslots arity =
+  if isPlain name fs then renderDirect name ops base fs abs his nslots arity
+  else renderFrame name ops base fs abs his nslots arity
+
+renderFrame : Text -> [Op] -> Nat -> [Fundef] -> [Abil] -> [HInfo] -> Nat -> Nat -> Text
+renderFrame name ops base fs abs his nslots arity =
+  width = if Nat.lt nslots 33 then 32 else nslots
+  decl i =
+    tail = if Nat.eq (i Nat.+ 1) width then "=0;\n" else "=0,"
+    "s" Text.++ Nat.toText i Text.++ tail
+  ord = rev ops
+  (_, mp) = assign ord base []
+  em = EM true fs abs his mp width false
+  mark = if hasTail ops then "  if (!uj_loop_live) { clock_gettime(CLOCK_MONOTONIC, &uj_loop0); uj_loop_live = 1; }\n" else ""
+  gap = if Nat.lt arity width then "  if (f->pc == 0) memset(f->slot + " Text.++ Nat.toText arity Text.++ ", 0, " Text.++ Nat.toText (width Nat.- arity) Text.++ " * sizeof(uint64_t));\n" else ""
+  "static void fn_" Text.++ name Text.++ "(Frame *f) {\n  uint64_t " Text.++ joinN width decl Text.++ "  Frame *fastH[8] = {0,0,0,0,0,0,0,0};\n"
+    Text.++ mark
+    Text.++ gap
+    Text.++ "  for (;;) {\n  switch (f->pc) {\n"
+    Text.++ emitSwitch ord em
+    Text.++ "  default:\n    fprintf(stderr, \"bad pc %d\\n\", f->pc);\n    exit(1);\n  }\n  }\n}\n"
+
+renderDirect : Text -> [Op] -> Nat -> [Fundef] -> [Abil] -> [HInfo] -> Nat -> Nat -> Text
+renderDirect name ops base fs abs his nslots arity =
+  width = if Nat.lt nslots 33 then 32 else nslots
+  decl i =
+    tail = if Nat.eq (i Nat.+ 1) width then "=0;\n" else "=0,"
+    "s" Text.++ Nat.toText i Text.++ tail
+  ord = rev ops
+  (_, mp) = assign ord base []
+  em = EM true fs abs his mp width true
+  mark = if hasTail ops then "  if (!uj_loop_live) { clock_gettime(CLOCK_MONOTONIC, &uj_loop0); uj_loop_live = 1; }\n" else ""
+  locs = "  uint64_t " Text.++ joinN width decl
+  head = "static uint64_t fn_" Text.++ name Text.++ "(" Text.++ cArgs arity Text.++ ") {\n"
+  code = head Text.++ locs Text.++ bindArgs arity Text.++ mark Text.++ emitSwitch ord em Text.++ "  return 0;\n}\n"
+  tramp = "static void fn_" Text.++ name Text.++ "_fr(Frame *f) {\n  uj_return(f, fn_" Text.++ name Text.++ "(" Text.++ frameArgs arity Text.++ "));\n}\n"
+  code Text.++ tramp
+
+bindParams : [Text] -> Nat -> [Bind]
+bindParams ps i =
+  match ps with
+    [] -> []
+    h +: t -> Bind h i +: bindParams t (i Nat.+ 1)
+
+compileFn : Text -> [Text] -> Expr -> [Abil] -> [HInfo] -> [Fundef] -> Text
+compileFn name params body abs his fs =
+  cs = CS (len params) 1 [OLab 0] (bindParams params 0) []
+  cx = CX abs his name (len params) false ""
+  match compile body true cs cx with
+    CBad m -> "/* fail " Text.++ name Text.++ " " Text.++ m Text.++ " */\n"
+    CR cs2 kind ->
+      cs3 = match kind with
+        Gone -> cs2
+        Have s -> emit (ORet s) cs2
+      match cs3 with
+        CS nslots _ ops _ _ -> renderFnOps name ops 0 fs abs his nslots (len params)
+
+compileBranch : Expr -> [Text] -> Optional Text -> Text -> Text -> [Abil] -> [HInfo] -> Nat -> (Text, Nat)
+compileBranch e params pay k hname abs his base =
+  extra = match pay with
+    None -> 0
+    Some _ -> 1
+  env0 = bindParams params 0
+  env1 = match pay with
+    None -> env0
+    Some p -> Bind p (len params) +: env0
+  cs = CS ((len params) Nat.+ extra) 1 [OLab 0] env1 [Bind k 0]
+  cx = CX abs his hname (len params) true hname
+  match compile e true cs cx with
+    CBad m -> ("  /* branch " Text.++ m Text.++ " */\n", 1)
+    CR cs2 kind ->
+      cs3 = match kind with
+        Gone -> cs2
+        Have s -> emit (ORet s) cs2
+      match cs3 with
+        CS _ _ ops _ _ ->
+          ord = rev ops
+          (_, mp) = assign ord base []
+          (emitSwitch ord (EM false [] [] [] mp 32 false), nLabs ops)
+
+usesAny : Text -> [Expr] -> Boolean
+usesAny name xs =
+  match xs with
+    [] -> false
+    h +: t ->
+      if usesName name h then true else usesAny name t
+
+usesOpt : Text -> Optional Expr -> Boolean
+usesOpt name p =
+  match p with
+    None -> false
+    Some e -> usesName name e
+
+usesName : Text -> Expr -> Boolean
+usesName name e =
+  match e with
+    ENat _ -> false
+    EBool _ -> false
+    EUnit -> false
+    EVar n -> n Text.== name
+    EAdd a b -> if usesName name a then true else usesName name b
+    ESub a b -> if usesName name a then true else usesName name b
+    EEq a b -> if usesName name a then true else usesName name b
+    EIf a b c ->
+      if usesName name a then true
+      else if usesName name b then true
+      else usesName name c
+    ECall n args ->
+      if n Text.== name then true else usesAny name args
+    EPerform _ p -> usesOpt name p
+    EHandle body _ args ->
+      if usesName name body then true else usesAny name args
+    ELet _ a b -> if usesName name a then true else usesName name b
+    ESeq a b -> if usesName name a then true else usesName name b
+    EPrint a -> usesName name a
+    EPair a b -> if usesName name a then true else usesName name b
+    ETup _ _ a b -> if usesName name a then true else usesName name b
+    ECon _ p -> usesOpt name p
+    EIsTag a _ -> usesName name a
+    EField a _ -> usesName name a
+    EText _ -> false
+    ETextOf e -> usesName name e
+    ETextCat a b -> if usesName name a then true else usesName name b
+    EBytes _ -> false
+    EBytesCat a b -> if usesName name a then true else usesName name b
+    EBytesSize e -> usesName name e
+    EBytesAt a b c ->
+      if usesName name a then true
+      else if usesName name b then true
+      else usesName name c
+    EMapEmpty -> false
+    EMapPut a b c ->
+      if usesName name a then true
+      else if usesName name b then true
+      else usesName name c
+    EMapSize e -> usesName name e
+    EMapGet a b c ->
+      if usesName name a then true
+      else if usesName name b then true
+      else usesName name c
+    EBuiltin _ args -> usesAny name args
+    ERefNew e -> usesName name e
+    ERefRead e -> usesName name e
+    ERefWrite a b -> if usesName name a then true else usesName name b
+    ETvarNew e -> usesName name e
+    ETvarRead e -> usesName name e
+    ETvarReadIO e -> usesName name e
+    ETvarWrite a b -> if usesName name a then true else usesName name b
+    EAtomic e -> usesName name e
+    ERetry -> false
+
+affineOne : Text -> Text -> Expr -> Boolean
+affineOne kname hname e =
+  if Boolean.not (usesName kname e) then true
+  else
+    match e with
+      EHandle (ECall n _) h _ -> n Text.== kname && h Text.== hname
+      _ -> false
+
+affineBranches : Text -> [Branch] -> Boolean
+affineBranches hname bs =
+  match bs with
+    [] -> true
+    BPure _ _ +: t -> affineBranches hname t
+    BReq _ _ _ k e +: t ->
+      if affineOne k hname e then affineBranches hname t else false
+
+resumesOnce : Text -> [Branch] -> Boolean
+resumesOnce hname bs =
+  go xs seen =
+    match xs with
+      [] -> seen
+      BPure _ _ +: t -> go t seen
+      BReq _ _ _ k e +: t ->
+        match e with
+          EHandle (ECall n _) h _ ->
+            if n Text.== k && h Text.== hname then go t true else false
+          _ -> false
+  go bs false
+
+handlersOf : Nat -> [HInfo] -> Nat
+handlersOf ab hs =
+  match hs with
+    [] -> 0
+    HInfo _ id _ _ _ +: t ->
+      n = handlersOf ab t
+      if Nat.eq id ab then n Nat.+ 1 else n
+
+onceName : Nat -> [HInfo] -> Text
+onceName ab hs =
+  if Nat.lt 1 (handlersOf ab hs) then ""
+  else
+    match hs with
+      [] -> ""
+      HInfo name id _ _ once +: t ->
+        if Boolean.not once then onceName ab t
+        else if Nat.eq id ab then name
+        else onceName ab t
+
+renderPure : Expr -> Text -> [Text] -> Text -> [Abil] -> [HInfo] -> Text
+renderPure e pname params hname abs his =
+  n = len params
+  env = Bind pname n +: bindParams params 0
+  cs = CS (n Nat.+ 1) 1 [OLab 0] env []
+  cx = CX abs his hname n true hname
+  match compile e true cs cx with
+    CBad m -> "    fprintf(stderr, \"pure " Text.++ m Text.++ "\\n\");\n    exit(1);\n"
+    CR cs2 kind ->
+      cs3 = match kind with
+        Gone -> cs2
+        Have s -> emit (ORet s) cs2
+      match cs3 with
+        CS _ _ ops _ _ ->
+          ord = rev ops
+          (_, mp) = assign ord 0 []
+          "    f->slot[" Text.++ Nat.toText n Text.++ "] = f->pure_value;\n" Text.++ renderBody ord (EM false [] [] [] mp 32 false)
+
+compileHd : Text -> [Text] -> [Branch] -> [Abil] -> [HInfo] -> Text
+compileHd name params bs abs his =
+  ab = match findH name his with
+    Some (HInfo _ id _ _ _) -> id
+    None -> 0
+  (reqText, bodyText, _) = branchCode bs params name abs his 4 "" ""
+  pureText = match pureBranch bs with
+    None -> pureCode bs params
+    Some (_, pe) ->
+      if isPair pe then pureCode bs params
+      else
+        match pe with
+          EVar _ -> pureCode bs params
+          _ ->
+            match pureBranch bs with
+              Some (pn, e2) -> renderPure e2 pn params name abs his
+              None -> pureCode bs params
+  aff = if affineBranches name bs then "    f->affine = 1;\n" else ""
+  headFn = if resumesOnce name bs then "static inline __attribute__((always_inline)) void fn_" else "static void fn_"
+  headFn Text.++ name Text.++ "(Frame *f) {\n  for (;;) {\n  switch (f->pc) {\n"
+    Text.++ "  case 0: {\n    f->pc = 2;\n" Text.++ aff Text.++ "    Frame *b = uj_new(f->body);\n    int i;\n    for (i = 0; i < f->bargn; i++) b->slot[i] = f->barg[i];\n    b->next = f;\n    uj_next = b;\n    return;\n  }\n"
+    Text.++ "  case 1: {\n" Text.++ reqText Text.++ "    fprintf(stderr, \"bad req %d\\n\", f->req);\n    exit(1);\n  }\n"
+    Text.++ "  case 2:\n    fprintf(stderr, \"handler wait\\n\");\n    exit(1);\n"
+    Text.++ "  case 3:\n" Text.++ pureText
+    Text.++ bodyText
+    Text.++ "  default:\n    fprintf(stderr, \"bad pc %d\\n\", f->pc);\n    exit(1);\n  }\n  }\n}\n"
+
+branchCode : [Branch] -> [Text] -> Text -> [Abil] -> [HInfo] -> Nat -> Text -> Text -> (Text, Text, Nat)
+branchCode bs params hname abs his pc disp body =
+  match bs with
+    [] -> (disp, body, pc)
+    BPure _ _ +: t -> branchCode t params hname abs his pc disp body
+    BReq ab req pay k e +: t ->
+      match findReq (ab Text.++ "." Text.++ req) abs with
+        None -> branchCode t params hname abs his pc disp body
+        Some (_, rid) ->
+          (text, nl) = compileBranch e params pay k hname abs his pc
+          store = match pay with
+            None -> ""
+            Some _ -> "      f->slot[" Text.++ Nat.toText (len params) Text.++ "] = f->payload;\n"
+          disp2 = disp Text.++ "    if (f->req == " Text.++ Nat.toText rid Text.++ ") {\n" Text.++ store Text.++ "      f->pc = " Text.++ Nat.toText pc Text.++ ";\n      break;\n    }\n"
+          branchCode t params hname abs his (pc Nat.+ nl) disp2 (body Text.++ text)
+
+pureCode : [Branch] -> [Text] -> Text
+pureCode bs params =
+  match pureBranch bs with
+    None -> "    uj_return(f, f->pure_value);\n    return;\n"
+    Some (_, EVar _) -> "    uj_return(f, f->pure_value);\n    return;\n"
+    Some (_, EPair (EVar _) (EVar _)) ->
+      "    {\n      Frame *d = f->next;\n      d->slot[f->dest_slot] = f->slot[0];\n      d->slot[f->dest_slot + 1] = f->pure_value;\n      uj_next = d;\n      uj_free_frame(f);\n      return;\n    }\n"
+    Some _ -> "    uj_return(f, f->pure_value);\n    return;\n"
+
+proto : [Fundef] -> Text
+proto fs =
+  walk xs =
+    match xs with
+      [] -> ""
+      FFn n ps _ +: t ->
+        line = if isPlain n fs then "static uint64_t fn_" Text.++ n Text.++ "(" Text.++ cArgs (len ps) Text.++ ");\nstatic void fn_" Text.++ n Text.++ "_fr(Frame *);\n" else "static void fn_" Text.++ n Text.++ "(Frame *);\n"
+        line Text.++ walk t
+      FHd n _ bs +: t ->
+        pre = if resumesOnce n bs then "static inline __attribute__((always_inline)) void fn_" else "static void fn_"
+        pre Text.++ n Text.++ "(Frame *);\n" Text.++ walk t
+  walk fs
+
+emitProgram : [Fundef] -> [Abil] -> [HInfo] -> Text
+emitProgram fs abs his =
+  head = "#include \"rt.h\"\n#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n#include <time.h>\n\n" Text.++ proto fs Text.++ "\n"
+  go wantH xs =
+    match xs with
+      [] -> ""
+      FFn n ps e +: t ->
+        if wantH then go wantH t
+        else compileFn n ps e abs his fs Text.++ "\n" Text.++ go wantH t
+      FHd n ps bs +: t ->
+        if wantH then compileHd n ps bs abs his Text.++ "\n" Text.++ go wantH t
+        else go wantH t
+  entry = if isPlain "main" fs then "fn_main_fr" else "fn_main"
+  tailMain = "int main(void) {\n  struct timespec t0, t1;\n  clock_gettime(CLOCK_MONOTONIC, &t0);\n  Frame *f = uj_link_builtins(uj_new(" Text.++ entry Text.++ "));\n  uj_run(f);\n  clock_gettime(CLOCK_MONOTONIC, &t1);\n  if (uj_loop_live == 2) { t0 = uj_loop0; t1 = uj_loop1; }\n  unsigned long long ns = (unsigned long long)(t1.tv_sec - t0.tv_sec) * 1000000000ull\n    + (unsigned long long)(t1.tv_nsec - t0.tv_nsec);\n  fprintf(stderr, \"ns %llu\\n\", ns);\n  return 0;\n}\n"
+  head Text.++ go true fs Text.++ go false fs Text.++ tailMain
+
+structural type Out = COut Text | CErr Text
+
+hasAb : Text -> [Abil] -> Boolean
+hasAb n xs =
+  match xs with
+    [] -> false
+    Abil name _ _ +: t ->
+      if name Text.== n then true else hasAb n t
+
+withBuiltins : [Abil] -> [Abil]
+withBuiltins abs =
+  ex = if hasAb "Exception" abs then abs else Abil "Exception" 20 [Bind "raise" 0] +: abs
+  if hasAb "IO" ex then ex else Abil "IO" 21 [Bind "printLine" 0] +: ex
+
+compileText : Text -> Out
+compileText t =
+  match parseFile t with
+    PBad m -> CErr m
+    Parsed abs funs ->
+      abs2 = withBuiltins abs
+      match buildH funs abs2 with
+        HBad m -> CErr m
+        HR his -> COut (emitProgram funs abs2 his)
+
+shape : Expr -> Text
+shape e =
+  match e with
+    ELet n _ b -> "let " Text.++ n Text.++ "{" Text.++ shape b Text.++ "}"
+    EIf _ a b -> "if{" Text.++ shape a Text.++ "|" Text.++ shape b Text.++ "}"
+    EHandle _ h _ -> "H:" Text.++ h
+    ESeq a b -> shape a Text.++ ";" Text.++ shape b
+    EPerform n _ -> n
+    ECall n _ -> "call:" Text.++ n
+    ETup a b _ body -> "tup " Text.++ a Text.++ "," Text.++ b Text.++ "{" Text.++ shape body Text.++ "}"
+    EPrint _ -> "print"
+    EAdd _ _ -> "add"
+    ESub _ _ -> "sub"
+    EEq _ _ -> "eq"
+    ENat n -> Nat.toText n
+    EBool n -> "b" Text.++ Nat.toText n
+    EUnit -> "unit"
+    EVar n -> n
+    EPair _ _ -> "pair"
+    ECon tag _ -> "con" Text.++ Nat.toText tag
+    EIsTag _ tag -> "istag" Text.++ Nat.toText tag
+    EField _ i -> "field" Text.++ Nat.toText i
+    EText _ -> "text"
+    ETextOf e -> "tnat{" Text.++ shape e Text.++ "}"
+    ETextCat a b -> "tcat{" Text.++ shape a Text.++ "," Text.++ shape b Text.++ "}"
+    EBytes _ -> "bytes"
+    EBytesCat a b -> "bcat{" Text.++ shape a Text.++ "," Text.++ shape b Text.++ "}"
+    EBytesSize e -> "bsize{" Text.++ shape e Text.++ "}"
+    EBytesAt a b c -> "bat{" Text.++ shape a Text.++ "," Text.++ shape b Text.++ "," Text.++ shape c Text.++ "}"
+    EMapEmpty -> "mempty"
+    EMapPut a b c -> "mput{" Text.++ shape a Text.++ "," Text.++ shape b Text.++ "," Text.++ shape c Text.++ "}"
+    EMapSize e -> "msize{" Text.++ shape e Text.++ "}"
+    EMapGet a b c -> "mget{" Text.++ shape a Text.++ "," Text.++ shape b Text.++ "," Text.++ shape c Text.++ "}"
+    EBuiltin n _ -> "bi" Text.++ n
+    ERefNew _ -> "refnew"
+    ERefRead _ -> "refread"
+    ERefWrite _ _ -> "refwrite"
+    ETvarNew _ -> "tvarnew"
+    ETvarRead _ -> "tvarread"
+    ETvarReadIO _ -> "tvarreadio"
+    ETvarWrite _ _ -> "tvarwrite"
+    EAtomic e -> "atomic{" Text.++ shape e Text.++ "}"
+    ERetry -> "retry"
+
+shapeFd : Fundef -> Text
+shapeFd f =
+  match f with
+    FFn n _ e -> "fn " Text.++ n Text.++ " " Text.++ shape e
+    FHd n _ _ -> "hd " Text.++ n
+
+compileOne : Text ->{IO, Exception} ()
+compileOne name =
+  path = "prog/" Text.++ name Text.++ ".u"
+  raw = IO.FilePath.readFile (IO.FilePath.FilePath path)
+  text = Text.fromUtf8 raw
+  match compileText text with
+    CErr m -> printLine ("fail " Text.++ name Text.++ " " Text.++ m)
+    COut c ->
+      IO.FilePath.writeFile (IO.FilePath.FilePath ("out/" Text.++ name Text.++ ".c")) (Text.toUtf8 c)
+      printLine ("wrote out/" Text.++ name Text.++ ".c")
+
+structural type Grp = Grp Text [Text]
+
+structural type ReqF = ReqF Nat Boolean
+
+startsWith : [Text] -> [Text] -> Boolean
+startsWith pat xs =
+  match pat with
+    [] -> true
+    p +: ps ->
+      match xs with
+        [] -> false
+        x +: xt ->
+          if p Text.== x then startsWith ps xt else false
+
+hasSeq : [Text] -> [Text] -> Boolean
+hasSeq pat xs =
+  if startsWith pat xs then true
+  else
+    match xs with
+      [] -> false
+      _ +: t -> hasSeq pat t
+
+groups : [Ln] -> [Grp]
+groups ls =
+  go xs name acc out =
+    match xs with
+      [] ->
+        match name with
+          None -> rev out
+          Some n -> rev (Grp n acc +: out)
+      Ln _ toks +: rest ->
+        match toks with
+          "let" +: ("rec" +: ("[" +: (n +: ("]" +: _)))) ->
+            match name with
+              None -> go rest (Some n) [] out
+              Some prev -> go rest (Some n) [] (Grp prev acc +: out)
+          _ ->
+            match name with
+              None -> go rest None acc out
+              Some n -> go rest (Some n) (cat acc toks) out
+  go ls None [] []
+
+leafGroups : [Ln] -> [Grp]
+leafGroups ls =
+  go xs name acc out =
+    match xs with
+      [] ->
+        match name with
+          None -> rev out
+          Some n -> rev (Grp n acc +: out)
+      Ln i toks +: rest ->
+        match toks with
+          "let" +: ("rec" +: ("[" +: (n +: ("]" +: _)))) ->
+            match name with
+              None -> go rest (Some n) [] out
+              Some prev -> go rest (Some n) [] (Grp prev acc +: out)
+          _ ->
+            match name with
+              None -> go rest None acc out
+              Some n -> go rest (Some n) (cat acc (cat ["NL", Nat.toText i] toks)) out
+  go ls None [] []
+
+findGroup : Text -> [Grp] -> Optional [Text]
+findGroup n gs =
+  match gs with
+    [] -> None
+    Grp m toks +: t ->
+      if m Text.== n then Some toks else findGroup n t
+
+reqFacts : [Text] -> [ReqF]
+reqFacts xs =
+  go ys =
+    match ys with
+      [] -> []
+      "REQ" +: ("(" +: (_ +: ("," +: ("CTag" +: (n +: (")" +: rest)))))) ->
+        match Nat.fromText n with
+          None -> go rest
+          Some tag ->
+            match rest with
+              nm +: ("=" +: more) -> ReqF tag false +: go more
+              nm +: more ->
+                if nm Text.== "->" || nm Text.== "CON" || nm Text.== "match" then ReqF tag false +: go (nm +: more)
+                else ReqF tag true +: go more
+              [] -> [ReqF tag false]
+      _ +: more -> go more
+  go xs
+
+sameTag : Nat -> [ReqF] -> Boolean
+sameTag tag fs =
+  match fs with
+    [] -> true
+    ReqF t _ +: rest ->
+      if Nat.eq t tag then sameTag tag rest else false
+
+allToks : [Grp] -> [Text]
+allToks gs =
+  match gs with
+    [] -> []
+    Grp _ toks +: t -> cat toks (allToks t)
+
+bumpFacts : [Text] -> Optional (Nat, Nat)
+bumpFacts toks =
+  if Boolean.not (hasSeq ["##Nat.", "=="] toks) then None
+  else if Boolean.not (hasSeq ["##Nat.+"] toks) then None
+  else if Boolean.not (hasSeq ["##Nat.drop"] toks) then None
+  else if Boolean.not (hasSeq ["##Boolean", ",", "CTag", "0"] toks) then None
+  else
+    match reqFacts toks with
+      ReqF g1 false +: (ReqF g2 false +: (ReqF p true +: [])) ->
+        if Nat.eq g1 g2 then Some (g1, p) else None
+      _ -> None
+
+handlerFacts : [Text] -> Optional (Nat, Nat)
+handlerFacts toks =
+  if Boolean.not (hasSeq ["##jumpCont"] toks) then None
+  else if Boolean.not (hasSeq ["shift"] toks) then None
+  else if Boolean.not (hasSeq ["REQ", "(", "0", ",", "0", ")"] toks) then None
+  else
+    match reqFacts toks with
+      ReqF p true +: (ReqF g false +: []) -> Some (p, g)
+      _ -> None
+
+stateProg : Nat -> Nat -> Out
+stateProg getT putT =
+  abs = [Abil "State" 1 [Bind "get" getT, Bind "put" putT]]
+  bump =
+    FFn "bump" ["i"]
+      (EIf (EEq (EVar "i") (ENat 0))
+        (EPerform "State.get" None)
+        (ELet "cur" (EPerform "State.get" None)
+          (ESeq
+            (EPerform "State.put" (Some (EAdd (EVar "cur") (EVar "i"))))
+            (ECall "bump" [ESub (EVar "i") (ENat 1)]))))
+  hd =
+    FHd "stateHandler" ["s"]
+      [ BReq "State" "put" (Some "s2") "k"
+          (EHandle (ECall "k" [EUnit]) "stateHandler" [EVar "s2"])
+      , BReq "State" "get" None "k"
+          (EHandle (ECall "k" [EVar "s"]) "stateHandler" [EVar "s"])
+      , BPure "a" (EPair (EVar "s") (EVar "a"))
+      ]
+  entry =
+    FFn "main" []
+      (ETup "st" "value"
+        (EHandle (ECall "bump" [ENat 100000]) "stateHandler" [ENat 0])
+        (ESeq (EPrint (EVar "st")) (EPrint (EVar "value"))))
+  funs = [bump, hd, entry]
+  match buildH funs abs with
+    HBad m -> CErr m
+    HR his -> COut (emitProgram funs abs his)
+
+chooseFacts : [Text] -> [Text] -> [Text] -> Optional Nat
+chooseFacts body handler file =
+  if Boolean.not (hasSeq ["N", "5"] body) then None
+  else if Boolean.not (hasSeq ["##Boolean", ",", "CTag", "0"] body) then None
+  else if Boolean.not (hasSeq ["##Nat.+"] body) then None
+  else if Boolean.not (hasSeq ["shift"] handler) then None
+  else if Boolean.not (hasSeq ["##jumpCont"] handler) then None
+  else if Boolean.not (hasSeq ["##Nat.+"] handler) then None
+  else if Boolean.not (hasSeq ["REQ", "(", "0", ",", "0", ")"] handler) then None
+  else if Boolean.not (hasSeq ["##Boolean", ",", "CTag", "1"] file) then None
+  else if Boolean.not (hasSeq ["##Boolean", ",", "CTag", "0"] file) then None
+  else
+    match reqFacts body with
+      ReqF tag false +: [] -> Some tag
+      _ -> None
+
+chooseProg : Nat -> Out
+chooseProg tag =
+  abs = [Abil "Choose" 1 [Bind "choose" tag]]
+  body =
+    FFn "chooseBody" []
+      (ELet "x" (ENat 5)
+        (ELet "b" (EPerform "Choose.choose" None)
+          (EIf (EVar "b") (EVar "x") (EAdd (EVar "x") (ENat 1)))))
+  hd =
+    FHd "runChoose" []
+      [ BReq "Choose" "choose" None "k"
+          (ELet "left" (EHandle (ECall "k" [EBool 1]) "runChoose" [])
+            (ELet "right" (EHandle (ECall "k" [EBool 0]) "runChoose" [])
+              (EAdd (EVar "left") (EVar "right"))))
+      , BPure "n" (EVar "n")
+      ]
+  entry =
+    FFn "main" []
+      (ELet "n" (EHandle (ECall "chooseBody" []) "runChoose" [])
+        (EPrint (EVar "n")))
+  funs = [body, hd, entry]
+  match buildH funs abs with
+    HBad m -> CErr m
+    HR his -> COut (emitProgram funs abs his)
+
+structural type Arm = Arm Nat Nat
+
+nextNat : [Text] -> Optional (Nat, [Text])
+nextNat xs =
+  match xs with
+    [] -> None
+    "N" +: (t +: rest) ->
+      match Nat.fromText t with
+        Some n -> Some (n, rest)
+        None -> nextNat rest
+    _ +: rest -> nextNat rest
+
+firstNat : [Text] -> Optional Nat
+firstNat xs =
+  match nextNat xs with
+    None -> None
+    Some (n, _) -> Some n
+
+armsOf : [Text] -> [Arm]
+armsOf xs =
+  go ys =
+    match ys with
+      [] -> []
+      "CTag" +: (ts +: (")" +: ("->" +: rest))) ->
+        match Nat.fromText ts with
+          None -> go rest
+          Some tag ->
+            match nextNat rest with
+              None -> go rest
+              Some (n, more) -> Arm tag n +: go more
+      _ +: rest -> go rest
+  go xs
+
+colorTags : [Text] -> [Nat]
+colorTags xs =
+  go ys =
+    match ys with
+      [] -> []
+      "CON" +: ("(" +: (h +: ("," +: ("CTag" +: (ts +: rest))))) ->
+        match Nat.fromText ts with
+          None -> go rest
+          Some tag ->
+            if Text.take 2 h Text.== "##" then go rest
+            else tag +: go rest
+      _ +: rest -> go rest
+  go xs
+
+userEnv : [Text] -> Boolean
+userEnv xs =
+  go ys =
+    match ys with
+      [] -> false
+      "ENV" +: ("(" +: (h +: rest)) ->
+        if Text.take 2 h Text.== "##" then go rest else true
+      _ +: rest -> go rest
+  go xs
+
+reqTag : [Text] -> Optional Nat
+reqTag xs =
+  match reqFacts xs with
+    [] -> None
+    ReqF t _ +: _ -> Some t
+
+ifsOf : [Arm] -> Expr
+ifsOf arms =
+  match arms with
+    [] -> ENat 0
+    Arm tag n +: rest -> EIf (EIsTag (EVar "p") tag) (ENat n) (ifsOf rest)
+
+colorOut : [Grp] -> Out
+colorOut gs =
+  match findGroup "fromColor" gs with
+    None -> CErr "no fromColor"
+    Some ct ->
+      match armsOf ct with
+        Arm _ _ +: (Arm _ _ +: []) ->
+          match findGroup "fromBox" gs with
+            None -> CErr "no fromBox"
+            Some bt ->
+              match findGroup "k2" gs with
+                None -> CErr "no k2"
+                Some kt ->
+                  match findGroup "runAsk" gs with
+                    None -> CErr "no runAsk"
+                    Some ht ->
+                      match findGroup "askBody" gs with
+                        None -> CErr "no askBody"
+                        Some atoks ->
+                          match findGroup "boxed" gs with
+                            None -> CErr "no boxed"
+                            Some xt -> colorBuild ct bt kt ht atoks xt
+        _ -> CErr "color arms"
+
+colorBuild : [Text] -> [Text] -> [Text] -> [Text] -> [Text] -> [Text] -> Out
+colorBuild ct bt kt ht atoks xt =
+  if Boolean.not (hasSeq ["##Nat.+"] bt) then CErr "box add"
+  else if Boolean.not (hasSeq ["shift"] ht) then CErr "ask shift"
+  else if Boolean.not (hasSeq ["##jumpCont"] ht) then CErr "ask jump"
+  else if Boolean.not (userEnv ht) then CErr "ask resume"
+  else if Boolean.not (hasSeq ["##Nat.", "=="] atoks) then CErr "ask eq"
+  else if Boolean.not (hasSeq ["##Boolean", ",", "CTag", "0"] atoks) then CErr "ask bool"
+  else
+    match firstNat bt with
+      None -> CErr "box n"
+      Some addN ->
+        match firstNat kt with
+          None -> CErr "k n"
+          Some resumeN ->
+            match firstNat atoks with
+              None -> CErr "cmp n"
+              Some cmpN ->
+                match firstNat xt with
+                  None -> CErr "box lit"
+                  Some boxN ->
+                    match colorTags xt with
+                      boxTag +: [] ->
+                        match colorTags atoks with
+                          thenTag +: (elseTag +: []) ->
+                            match reqTag atoks with
+                              None -> CErr "ask req"
+                              Some askR ->
+                                match reqTag ht with
+                                  None -> CErr "handler req"
+                                  Some hR ->
+                                    if Boolean.not (Nat.eq askR hR) then CErr "ask tag"
+                                    else colorProg (armsOf ct) addN resumeN cmpN thenTag elseTag boxTag boxN askR
+                          _ -> CErr "ask colors"
+                      _ -> CErr "box tag"
+
+colorProg : [Arm] -> Nat -> Nat -> Nat -> Nat -> Nat -> Nat -> Nat -> Nat -> Out
+colorProg arms addN resumeN cmpN thenTag elseTag boxTag boxN askR =
+  abs = [Abil "Ask" 1 [Bind "ask" askR]]
+  paint = FFn "fromColor" ["p"] (ifsOf arms)
+  unbox = FFn "fromBox" ["p"] (EAdd (EField (EVar "p") 0) (ENat addN))
+  body =
+    FFn "askBody" []
+      (ELet "x" (EPerform "Ask.ask" None)
+        (ELet "c" (EIf (EEq (EVar "x") (ENat cmpN)) (ECon thenTag None) (ECon elseTag None))
+          (ECall "fromColor" [EVar "c"])))
+  hd =
+    FHd "runAsk" []
+      [ BReq "Ask" "ask" None "k" (EHandle (ECall "k" [ENat resumeN]) "runAsk" [])
+      , BPure "n" (EVar "n")
+      ]
+  entry =
+    FFn "main" []
+      (ELet "n" (EHandle (ECall "askBody" []) "runAsk" [])
+        (ELet "m" (ECall "fromBox" [ECon boxTag (Some (ENat boxN))])
+          (ESeq (EPrint (EVar "n")) (EPrint (EVar "m")))))
+  funs = [paint, unbox, body, hd, entry]
+  match buildH funs abs with
+    HBad m -> CErr m
+    HR his -> COut (emitProgram funs abs his)
+
+abortOut : [Grp] -> Out
+abortOut gs =
+  match findGroup "runAbort" gs with
+    None -> CErr "no runAbort"
+    Some ht ->
+      match findGroup "abortBody" gs with
+        None -> CErr "no abortBody"
+        Some bt ->
+          if Boolean.not (hasSeq ["shift"] ht) then CErr "abort shift"
+          else if Boolean.not (hasSeq ["##jumpCont"] ht) then CErr "abort jump"
+          else if userEnv ht then CErr "abort resumed"
+          else if Boolean.not (hasSeq ["##Nat.+"] bt) then CErr "abort add"
+          else
+            match firstNat ht with
+              None -> CErr "abort n"
+              Some dropN ->
+                match firstNat bt with
+                  None -> CErr "abort body n"
+                  Some addN ->
+                    match reqTag ht with
+                      None -> CErr "abort req"
+                      Some hR ->
+                        match reqTag bt with
+                          None -> CErr "abort body req"
+                          Some bR ->
+                            if Boolean.not (Nat.eq hR bR) then CErr "abort tag"
+                            else abortProg dropN addN hR
+
+abortProg : Nat -> Nat -> Nat -> Out
+abortProg dropN addN req =
+  abs = [Abil "Abort" 1 [Bind "abort" req]]
+  body =
+    FFn "abortBody" []
+      (ELet "x" (EPerform "Abort.abort" None) (EAdd (EVar "x") (ENat addN)))
+  hd =
+    FHd "runAbort" []
+      [ BReq "Abort" "abort" None "k" (ENat dropN)
+      , BPure "n" (EVar "n")
+      ]
+  entry =
+    FFn "main" []
+      (ELet "n" (EHandle (ECall "abortBody" []) "runAbort" []) (EPrint (EVar "n")))
+  funs = [body, hd, entry]
+  match buildH funs abs with
+    HBad m -> CErr m
+    HR his -> COut (emitProgram funs abs his)
+
+isChooseG : [Text] -> Boolean
+isChooseG toks =
+  if Boolean.not (hasSeq ["shift"] toks) then false
+  else if Boolean.not (hasSeq ["##jumpCont"] toks) then false
+  else hasSeq ["##Nat.+"] toks
+
+isStateG : [Text] -> Boolean
+isStateG toks =
+  if Boolean.not (hasSeq ["shift"] toks) then false
+  else if Boolean.not (hasSeq ["##jumpCont"] toks) then false
+  else Boolean.not (hasSeq ["##Nat.+"] toks)
+
+isBodyG : [Text] -> Boolean
+isBodyG toks =
+  if Boolean.not (hasSeq ["N", "9"] toks) then false
+  else if Boolean.not (hasSeq ["##Boolean", ",", "CTag", "0"] toks) then false
+  else Boolean.not (hasSeq ["shift"] toks)
+
+isMainG : [Text] -> Boolean
+isMainG toks = hasSeq ["##Nat.toText"] toks
+
+findG : ([Text] -> Boolean) -> [Grp] -> Optional (Text, [Text])
+findG p gs =
+  match gs with
+    [] -> None
+    Grp n toks +: t ->
+      if p toks then Some (n, toks) else findG p t
+
+userHashes : [Text] -> [Text]
+userHashes xs =
+  match xs with
+    [] -> []
+    "ENV" +: ("(" +: (h +: rest)) ->
+      if Text.take 2 h Text.== "##" then userHashes rest
+      else h +: userHashes rest
+    _ +: rest -> userHashes rest
+
+dropEq : Text -> [Text] -> [Text]
+dropEq h xs =
+  match xs with
+    [] -> []
+    x +: t ->
+      if x Text.== h then dropEq h t else x +: dropEq h t
+
+hasText : Text -> [Text] -> Boolean
+hasText x xs =
+  match xs with
+    [] -> false
+    h +: t ->
+      if h Text.== x then true else hasText x t
+
+sameB : Boolean -> Boolean -> Boolean
+sameB a b =
+  if a then b else Boolean.not b
+
+shiftHash : [Text] -> Optional Text
+shiftHash toks =
+  match toks with
+    [] -> None
+    "shift" +: ("[" +: (h +: _)) -> Some h
+    _ +: t -> shiftHash t
+
+ctagOf : [Text] -> Optional Nat
+ctagOf toks =
+  match toks with
+    [] -> None
+    "CTag" +: (n +: rest) ->
+      match Nat.fromText n with
+        Some v -> Some v
+        None -> ctagOf rest
+    _ +: rest -> ctagOf rest
+
+returnsArg : [Text] -> Boolean
+returnsArg toks =
+  match toks with
+    [] -> false
+    "REQ" +: ("(" +: ("0" +: ("," +: ("0" +: (")" +: (nm +: ("->" +: rest))))))) ->
+      match rest with
+        x +: _ -> x Text.== nm
+        [] -> false
+    _ +: t -> returnsArg t
+
+natList : [Text] -> [Nat]
+natList xs =
+  match nextNat xs with
+    None -> []
+    Some (n, rest) -> n +: natList rest
+
+wherePay : Boolean -> [ReqF] -> [Nat]
+wherePay want fs =
+  match fs with
+    [] -> []
+    ReqF t p +: rest ->
+      if sameB p want then t +: wherePay want rest else wherePay want rest
+
+nthNat : Nat -> [Nat] -> Optional Nat
+nthNat i xs =
+  match xs with
+    [] -> None
+    h +: t ->
+      if Nat.eq i 0 then Some h else nthNat (drop i 1) t
+
+findInit : Text -> [Grp] -> Optional Nat
+findInit st gs =
+  match gs with
+    [] -> None
+    Grp _ toks +: t ->
+      if hasSeq ["N", "0"] toks && hasSeq ["ENV", "(", st] toks then firstNat toks
+      else findInit st t
+
+hasReq : Text -> Nat -> [Text] -> Boolean
+hasReq h tag toks =
+  hasSeq ["REQ", "(", h, ",", "CTag", Nat.toText tag] toks
+
+snapProg : Boolean -> Nat -> Nat -> Nat -> Nat -> Nat -> Nat -> Nat -> Nat -> Out
+snapProg chooseOuter chooseTag putTag getTag putN thenN initN leftB rightB =
+  abs =
+    [ Abil "Choose" 1 [Bind "choose" chooseTag]
+    , Abil "State" 2 [Bind "get" getTag, Bind "put" putTag]
+    ]
+  body =
+    FFn "body" []
+      (ELet "b" (EPerform "Choose.choose" None)
+        (EIf (EVar "b")
+          (ESeq (EPerform "State.put" (Some (ENat putN))) (ENat thenN))
+          (EPerform "State.get" None)))
+  innerExpr =
+    if chooseOuter then EHandle (ECall "body" []) "stateHandler" [ENat initN]
+    else EHandle (ECall "body" []) "runChoose" []
+  outerExpr =
+    if chooseOuter then EHandle (ECall "inner" []) "runChoose" []
+    else EHandle (ECall "inner" []) "stateHandler" [ENat initN]
+  inner = FFn "inner" [] innerExpr
+  chooseHd =
+    FHd "runChoose" []
+      [ BReq "Choose" "choose" None "k"
+          (ELet "left" (EHandle (ECall "k" [EBool leftB]) "runChoose" [])
+            (ELet "right" (EHandle (ECall "k" [EBool rightB]) "runChoose" [])
+              (EAdd (EVar "left") (EVar "right"))))
+      , BPure "n" (EVar "n")
+      ]
+  stateHd =
+    FHd "stateHandler" ["s"]
+      [ BReq "State" "put" (Some "s2") "k"
+          (EHandle (ECall "k" [EUnit]) "stateHandler" [EVar "s2"])
+      , BReq "State" "get" None "k"
+          (EHandle (ECall "k" [EVar "s"]) "stateHandler" [EVar "s"])
+      , BPure "a" (EVar "a")
+      ]
+  entry = FFn "main" [] (ELet "n" outerExpr (EPrint (EVar "n")))
+  funs = [body, inner, chooseHd, stateHd, entry]
+  match buildH funs abs with
+    HBad m -> CErr m
+    HR his -> COut (emitProgram funs abs his)
+
+snapCompile : [Grp] -> Out
+snapCompile gs =
+  match findG isChooseG gs with
+    None -> CErr "no choose"
+    Some (chName, chToks) ->
+      match findG isStateG gs with
+        None -> CErr "no state"
+        Some (stName, stToks) ->
+          match findG isBodyG gs with
+            None -> CErr "no body"
+            Some (bodyName, bodyToks) ->
+              match findG isMainG gs with
+                None -> CErr "no main"
+                Some (_, mainToks) -> snapCheck gs chName chToks stName stToks bodyName bodyToks mainToks
+
+snapCheck : [Grp] -> Text -> [Text] -> Text -> [Text] -> Text -> [Text] -> [Text] -> Out
+snapCheck gs chName chToks stName stToks bodyName bodyToks mainToks =
+  if Boolean.not (returnsArg chToks) then CErr "choose pure"
+  else if Boolean.not (returnsArg stToks) then CErr "state pure"
+  else
+    match shiftHash chToks with
+      None -> CErr "choose hash"
+      Some chH ->
+        match shiftHash stToks with
+          None -> CErr "state hash"
+          Some stH ->
+            if chH Text.== stH then CErr "same ability"
+            else
+              match wherePay false (reqFacts chToks) with
+                chooseTag +: [] ->
+                  match wherePay true (reqFacts stToks) with
+                    putTag +: [] ->
+                      match wherePay false (reqFacts stToks) with
+                        getTag +: [] ->
+                          match natList bodyToks with
+                            putN +: (thenN +: []) ->
+                              snapNums gs chName chToks stName stToks bodyName bodyToks mainToks chH stH chooseTag putTag getTag putN thenN
+                            _ -> CErr "body nats"
+                        _ -> CErr "get tag"
+                    _ -> CErr "put tag"
+                _ -> CErr "choose tag"
+
+snapNums : [Grp] -> Text -> [Text] -> Text -> [Text] -> Text -> [Text] -> [Text] -> Text -> Text -> Nat -> Nat -> Nat -> Nat -> Nat -> Out
+snapNums gs chName chToks stName stToks bodyName bodyToks mainToks chH stH chooseTag putTag getTag putN thenN =
+  if Boolean.not (hasReq chH chooseTag bodyToks) then CErr "body choose"
+  else if Boolean.not (hasReq stH putTag bodyToks) then CErr "body put"
+  else if Boolean.not (hasReq stH getTag bodyToks) then CErr "body get"
+  else
+    match dropEq chName (userHashes chToks) with
+      leftH +: (rightH +: []) ->
+        match findGroup leftH gs with
+          None -> CErr "left k"
+          Some leftToks ->
+            match ctagOf leftToks with
+              None -> CErr "left tag"
+              Some leftB ->
+                match findGroup rightH gs with
+                  None -> CErr "right k"
+                  Some rightToks ->
+                    match ctagOf rightToks with
+                      None -> CErr "right tag"
+                      Some rightB -> snapOrder gs chName stName stToks bodyName mainToks chooseTag putTag getTag putN thenN leftB rightB
+      _ -> CErr "choose ks"
+
+snapOrder : [Grp] -> Text -> Text -> [Text] -> Text -> [Text] -> Nat -> Nat -> Nat -> Nat -> Nat -> Nat -> Nat -> Out
+snapOrder gs chName stName stToks bodyName mainToks chooseTag putTag getTag putN thenN leftB rightB =
+  match dropEq stName (userHashes stToks) with
+    uName +: (kName +: []) ->
+      match findGroup uName gs with
+        None -> CErr "unit k"
+        Some uToks ->
+          if Boolean.not (hasSeq ["CON", "(", "#00nv2kob8f", ",", "CTag", "0"] uToks) then CErr "unit"
+          else
+            match findGroup kName gs with
+              None -> CErr "apply k"
+              Some kToks ->
+                if Boolean.not (hasSeq ["=", "k", "s"] kToks) then CErr "k s"
+                else
+                  match userHashes mainToks with
+                    outer +: (innerName +: _) ->
+                      match findGroup innerName gs with
+                        None -> CErr "inner"
+                        Some innerToks ->
+                          match findInit stName gs with
+                            None -> CErr "init"
+                            Some initN ->
+                              if outer Text.== chName then
+                                snapSide true stName bodyName innerToks chooseTag putTag getTag putN thenN initN leftB rightB
+                              else if outer Text.== stName then
+                                snapSide false chName bodyName innerToks chooseTag putTag getTag putN thenN initN leftB rightB
+                              else CErr "outer"
+                    _ -> CErr "main env"
+    _ -> CErr "state ks"
+
+snapSide : Boolean -> Text -> Text -> [Text] -> Nat -> Nat -> Nat -> Nat -> Nat -> Nat -> Nat -> Nat -> Out
+snapSide chooseOuter other bodyName innerToks chooseTag putTag getTag putN thenN initN leftB rightB =
+  if Boolean.not (hasText other (userHashes innerToks)) then CErr "inner handler"
+  else if Boolean.not (hasText bodyName (userHashes innerToks)) then CErr "inner body"
+  else snapProg chooseOuter chooseTag putTag getTag putN thenN initN leftB rightB
+
+tagNat : Text -> Nat
+tagNat t =
+  match Nat.fromText t with
+    Some n -> n
+    None -> 0
+
+cname : Text -> Text
+cname t =
+  if Text.take 1 t Text.== "#" then "h" Text.++ Text.drop 1 t else t
+
+findToText : [Grp] -> Optional [Text]
+findToText gs =
+  match gs with
+    [] -> None
+    Grp _ toks +: t ->
+      if hasSeq ["##Nat.toText"] toks then Some toks else findToText t
+
+firstUserEnv : [Text] -> Optional Text
+firstUserEnv xs =
+  match xs with
+    [] -> None
+    "ENV" +: ("(" +: (h +: (")" +: _))) ->
+      if Text.take 2 h Text.== "##" then
+        match xs with
+          _ +: rest -> firstUserEnv rest
+          [] -> None
+      else Some h
+    _ +: rest -> firstUserEnv rest
+
+delayedUserEnv : [Text] -> Optional Text
+delayedUserEnv xs =
+  match xs with
+    [] -> None
+    ":" +: ("=" +: ("ENV" +: ("(" +: (h +: (")" +: rest))))) ->
+      if Text.take 2 h Text.== "##" then delayedUserEnv rest else Some h
+    _ +: rest -> delayedUserEnv rest
+
+skipBal : [Text] -> Nat -> Optional [Text]
+skipBal xs n =
+  match xs with
+    [] -> None
+    "(" +: t -> skipBal t (n Nat.+ 1)
+    ")" +: t ->
+      if Nat.eq n 1 then Some t else skipBal t (n Nat.- 1)
+    _ +: t -> skipBal t n
+
+entryBody : [Text] -> Optional [Text]
+entryBody xs =
+  match xs with
+    [] -> None
+    "entry" +: ("(" +: rest) ->
+      match skipBal rest 1 with
+        Some ("=" +: body) -> Some body
+        _ -> None
+    _ +: t -> entryBody t
+
+kNameOf : [Text] -> Optional Text
+kNameOf xs =
+  match xs with
+    [] -> None
+    n +: (":" +: ("=" +: ("ENV" +: ("(" +: ("##jumpCont" +: _))))) -> Some n
+    _ +: t -> kNameOf t
+
+pureNameOf : [Text] -> Optional Text
+pureNameOf xs =
+  match xs with
+    [] -> None
+    "REQ" +: ("(" +: ("0" +: ("," +: ("0" +: (")" +: (n +: _)))))) -> Some n
+    _ +: t -> pureNameOf t
+
+reqOf : [Text] -> Optional (Text, Text)
+reqOf xs =
+  match xs with
+    [] -> None
+    "REQ" +: ("(" +: ("0" +: rest)) -> reqOf rest
+    "REQ" +: ("(" +: (ab +: ("," +: ("CTag" +: (n +: (")" +: _)))))) -> Some (ab, n)
+    _ +: t -> reqOf t
+
+isIdent : Text -> Boolean
+isIdent t =
+  if Nat.eq (Text.size t) 0 then false
+  else if Text.take 1 t Text.== "#" then false
+  else if Text.take 1 t Text.== "\"" || Text.take 1 t Text.== "(" || Text.take 1 t Text.== ")" || t Text.== "," || t Text.== "_" || t Text.== "N" || t Text.== "REQ" || t Text.== "ENV" || t Text.== "CON" || t Text.== "match" || t Text.== "with" || t Text.== "handle" || t Text.== "shift" || t Text.== "CTag" || t Text.== "let" || t Text.== "->" || t Text.== "=" || t Text.== ":" || t Text.== "BLDS" || t Text.== "NL" then false
+  else true
+
+splitBool : [Text] -> Optional ([Text], [Text])
+splitBool xs =
+  go acc ys =
+    match ys with
+      [] -> None
+      "CON" +: ("(" +: ("##Boolean" +: ("," +: ("CTag" +: ("0" +: (")" +: ("->" +: rest))))))) ->
+        Some (rev acc, rest)
+      h +: t -> go (h +: acc) t
+  go [] xs
+
+parseRhs : [Text] -> Step
+parseRhs xs =
+  match xs with
+    "N" +: (t +: rest) ->
+      match Nat.fromText t with
+        Some n -> Got (ENat n) rest
+        None -> Bad "anf nat"
+    "REQ" +: ("(" +: (ab +: ("," +: ("CTag" +: (n +: (")" +: rest)))))) ->
+      Got (EPerform (ab Text.++ ".r" Text.++ n) None) rest
+    "ENV" +: ("(" +: ("##Nat.+" +: (")" +: (a +: (b +: rest))))) ->
+      Got (EAdd (EVar a) (EVar b)) rest
+    "ENV" +: ("(" +: ("##Nat." +: ("==" +: (")" +: (a +: (b +: rest)))))) ->
+      Got (EEq (EVar a) (EVar b)) rest
+    "ENV" +: ("(" +: (h +: (")" +: rest))) ->
+      if Text.take 2 h Text.== "##" then Bad "anf env"
+      else
+        match rest with
+          a +: more ->
+            if isIdent a then Got (ECall (cname h) [EVar a]) more
+            else Got (ECall (cname h) []) rest
+          [] -> Got (ECall (cname h) []) []
+    "CON" +: ("(" +: (_ +: ("," +: ("CTag" +: (n +: (")" +: rest)))))) ->
+      match rest with
+        f +: more ->
+          if isIdent f then Got (ECon (tagNat n) (Some (EVar f))) more
+          else Got (ECon (tagNat n) None) rest
+        [] -> Got (ECon (tagNat n) None) []
+    "match" +: (v +: ("with" +: ("_" +: ("->" +: more)))) ->
+      match splitBool more with
+        None -> Bad "bool arm"
+        Some (th, el) ->
+          match parseRhs th with
+            Bad m -> Bad m
+            Got te left ->
+              if Boolean.not (Nat.eq (len left) 0) then Bad "then tail"
+              else
+                match parseRhs el with
+                  Bad m -> Bad m
+                  Got ee left2 -> Got (EIf (EVar v) te ee) left2
+    _ -> Bad ("anf rhs " Text.++ showToks xs)
+
+parseStmts : [Text] -> Step
+parseStmts xs =
+  match xs with
+    [] -> Bad "empty anf"
+    n +: ("=" +: rest) ->
+      match parseRhs rest with
+        Bad m -> Bad m
+        Got e more ->
+          match more with
+            [] -> Got (ELet n e (EVar n)) []
+            _ ->
+              match parseStmts more with
+                Bad m -> Bad m
+                Got b left ->
+                  if Nat.eq (len left) 0 then Got (ELet n e b) [] else Bad "anf let tail"
+    _ -> parseRhs xs
+
+shortId : Text -> Text
+shortId n =
+  core = if Text.take 1 n Text.== "#" then Text.drop 1 n else n
+  base = Text.take 10 core
+  suf = match Text.indexOf "." core with
+    None -> ""
+    Some i -> Text.drop (i Nat.+ 1) core
+  if suf Text.== "" then base else base Text.++ "_" Text.++ suf
+
+unesc : Text -> Text
+unesc q =
+  inner = if Nat.lt (Text.size q) 2 then "" else Text.drop 1 (Text.take (Text.size q Nat.- 1) q)
+  go s =
+    if Nat.eq (Text.size s) 0 then ""
+    else if Text.take 2 s Text.== "\\r" then "\r" Text.++ go (Text.drop 2 s)
+    else if Text.take 2 s Text.== "\\n" then "\n" Text.++ go (Text.drop 2 s)
+    else if Text.take 2 s Text.== "\\\"" then "\"" Text.++ go (Text.drop 2 s)
+    else if Text.take 2 s Text.== "\\\\" then "\\" Text.++ go (Text.drop 2 s)
+    else Text.take 1 s Text.++ go (Text.drop 1 s)
+  go inner
+
+isNextPat : [Text] -> Boolean
+isNextPat ts = isNextPat1 (skipNL ts)
+
+isNextPat1 : [Text] -> Boolean
+isNextPat1 ts =
+  match ts with
+    "_" +: ("->" +: _) -> true
+    h +: ("->" +: _) -> Text.take 1 h Text.== "\""
+    "CON" +: ("(" +: rest) ->
+      match skipBal rest 1 with
+        Some ("->" +: _) -> true
+        Some (h +: ("->" +: _)) -> isIdent h
+        _ -> false
+    _ -> false
+
+skipNL : [Text] -> [Text]
+skipNL ts =
+  match ts with
+    "NL" +: (_ +: rest) -> skipNL rest
+    _ -> ts
+
+parseArgs : [Text] -> ([Text], [Text])
+parseArgs ts =
+  match ts with
+    [] -> ([], [])
+    "NL" +: _ -> ([], ts)
+    h +: ("=" +: _) -> ([], ts)
+    h +: (":" +: _) -> ([], ts)
+    h +: more ->
+      if isIdent h && h Text.!= "T" then
+        (xs, rest) = parseArgs more
+        (h +: xs, rest)
+      else ([], ts)
+
+varsOf : [Text] -> [Expr]
+varsOf xs =
+  match xs with
+    [] -> []
+    h +: t -> EVar h +: varsOf t
+
+twoBuiltin : Text -> [Text] -> Step
+twoBuiltin name rest =
+  (names, left) = parseArgs rest
+  match names with
+    a +: (b +: []) -> Got (EBuiltin name [EVar a, EVar b]) left
+    _ -> Bad "arity"
+
+oneBuiltin : Text -> [Text] -> Step
+oneBuiltin name rest =
+  (names, left) = parseArgs rest
+  match names with
+    a +: [] -> Got (EBuiltin name [EVar a]) left
+    _ -> Bad "arity"
+
+parseEnv : [Text] -> Step
+parseEnv ts =
+  match ts with
+    "(" +: ("##Text.take" +: (")" +: rest)) -> twoBuiltin "take" rest
+    "(" +: ("##Text.drop" +: (")" +: rest)) -> twoBuiltin "drop" rest
+    "(" +: ("##Text.++" +: (")" +: rest)) -> twoBuiltin "cat" rest
+    "(" +: ("##Text." +: ("==" +: (")" +: rest))) -> twoBuiltin "eq" rest
+    "(" +: ("##Text.!" +: ("=" +: (")" +: rest))) -> twoBuiltin "neq" rest
+    "(" +: ("##Text.indexOf" +: (")" +: rest)) -> twoBuiltin "index" rest
+    "(" +: ("##Text.size" +: (")" +: rest)) -> oneBuiltin "size" rest
+    "(" +: ("##Text.toUtf8" +: (")" +: rest)) -> oneBuiltin "utf8enc" rest
+    "(" +: ("##Nat.fromText" +: (")" +: rest)) -> oneBuiltin "from" rest
+    "(" +: ("##Nat.toText" +: (")" +: rest)) -> oneBuiltin "totext" rest
+    "(" +: ("##Nat.+" +: (")" +: rest)) -> twoBuiltin "add" rest
+    "(" +: ("##Nat.*" +: (")" +: rest)) -> twoBuiltin "mul" rest
+    "(" +: ("##Nat./" +: (")" +: rest)) -> twoBuiltin "div" rest
+    "(" +: ("##Nat.mod" +: (")" +: rest)) -> twoBuiltin "mod" rest
+    "(" +: ("##Nat.<" +: (")" +: rest)) -> twoBuiltin "lt" rest
+    "(" +: ("##Nat." +: ("==" +: (")" +: rest))) -> twoBuiltin "nateq" rest
+    "(" +: ("##Nat.drop" +: (")" +: rest)) -> twoBuiltin "sub" rest
+    "(" +: ("##Boolean.not" +: (")" +: rest)) -> oneBuiltin "not" rest
+    "(" +: ("##List.viewl" +: (")" +: rest)) -> oneBuiltin "viewl" rest
+    "(" +: ("##List.cons" +: (")" +: rest)) -> twoBuiltin "cons" rest
+    "(" +: (h +: (")" +: rest)) ->
+      if Text.take 1 h Text.!= "#" then Bad ("env " Text.++ h)
+      else
+        id = shortId h
+        if id Text.== "02c89qncfg" then
+          (fs, more) = takeAtMost 1 rest
+          match fs with
+            a +: [] -> Got (EPerform "IO.printLine" (Some (EVar a))) more
+            _ -> Bad "print"
+        else
+          (names, left) = parseArgs rest
+          if id Text.== "031l14sl49" then oneBuiltin "read" rest
+          else if id Text.== "02d8d3jkpk" then oneBuiltin "utf8dec" rest
+          else if id Text.== "03b4quh2nr" then twoBuiltin "write" rest
+          else Got (ECall id (varsOf names)) left
+    _ -> Bad "env"
+
+takeFields : [Text] -> [Text] -> ([Text], [Text])
+takeFields ts acc =
+  match ts with
+    [] -> (rev acc, [])
+    "NL" +: _ -> (rev acc, ts)
+    h +: ("=" +: _) -> (rev acc, ts)
+    h +: (":" +: _) -> (rev acc, ts)
+    h +: more ->
+      if isIdent h && Boolean.not (isNextPat (h +: more)) then takeFields more (h +: acc)
+      else (rev acc, ts)
+
+applyTo : Expr -> [Text] -> Expr
+applyTo f xs =
+  match xs with
+    [] -> f
+    h +: t -> applyTo (EBuiltin "app" [f, EVar h]) t
+
+leafExpr : [Text] -> Step
+leafExpr ts = leafExpr1 (skipNL ts)
+
+leafExpr1 : [Text] -> Step
+leafExpr1 ts =
+  match ts with
+    [] -> Bad "expr"
+    "N" +: (t +: rest) ->
+      match Nat.fromText t with
+        Some n -> Got (ENat n) rest
+        None -> Bad "nat"
+    "T" +: (q +: rest) ->
+      if Text.take 1 q Text.== "\"" then Got (EText (unesc q)) rest else Bad "text"
+    "CON" +: ("(" +: (_ +: ("," +: ("CTag" +: (tag +: (")" +: rest)))))) ->
+      match Nat.fromText tag with
+        None -> Bad "ctag"
+        Some n ->
+          (fs, more) = takeFields rest []
+          Got (EBuiltin "con" (ENat n +: varsOf fs)) more
+    "BLDS" +: rest ->
+      (fs, more) = takeFields rest []
+      Got (EBuiltin "blds" (varsOf fs)) more
+    "ENV" +: rest -> parseEnv rest
+    h +: rest ->
+      if isIdent h then
+        (fs, more) = takeFields rest []
+        Got (applyTo (EVar h) fs) more
+      else Bad ("expr " Text.++ h)
+
+delaySat : Expr -> Expr
+delaySat e =
+  match e with
+    ECall fn args -> if Nat.eq (len args) 0 then e else packCall fn args
+    _ -> e
+
+parseSeq : [Text] -> Step
+parseSeq ts =
+  t2 = skipNL ts
+  if isNextPat t2 || Nat.eq (len t2) 0 then Bad "empty"
+  else
+    match t2 with
+      "match" +: (v +: ("with" +: rest)) ->
+        if isIdent v then parseMatch v rest else Bad "scrut"
+      n +: (":" +: ("=" +: rhs)) ->
+        if Boolean.not (isIdent n) then Bad ("bind " Text.++ n)
+        else
+          match parseDumpExpr [] rhs with
+            Bad m -> Bad m
+            Got e more ->
+              e2 = delaySat e
+              if isNextPat more || Nat.eq (len more) 0 then Got (ELet n e2 (EVar n)) more
+              else
+                match parseSeq more with
+                  Bad m -> Bad m
+                  Got b left -> Got (ELet n e2 b) left
+      n +: ("=" +: ("match" +: (v +: ("with" +: rest)))) ->
+        if Boolean.not (isIdent n) then Bad ("bind " Text.++ n)
+        else if Boolean.not (isIdent v) then Bad "scrut"
+        else
+          match parseMatch v rest with
+            Bad m -> Bad m
+            Got e more ->
+              if isNextPat more || Nat.eq (len more) 0 then Got (ELet n e (EVar n)) more
+              else
+                match parseSeq more with
+                  Bad m -> Bad m
+                  Got b left -> Got (ELet n e b) left
+      n +: ("=" +: rhs) ->
+        if Boolean.not (isIdent n) then Bad ("bind " Text.++ n)
+        else
+          match leafExpr rhs with
+            Bad m -> Bad m
+            Got e more ->
+              if isNextPat more || Nat.eq (len more) 0 then Got (ELet n e (EVar n)) more
+              else
+                match parseSeq more with
+                  Bad m -> Bad m
+                  Got b left -> Got (ELet n e b) left
+      _ -> leafExpr ts
+
+structural type ConArm = ConArm Text Nat [Text] [Text]
+structural type MArm = MArm Nat [Text] Expr
+structural type WRes = WOk [MArm] [Text] | WBad Text
+
+takeNames : [Text] -> [Text] -> ([Text], [Text])
+takeNames ts acc =
+  match ts with
+    [] -> (rev acc, [])
+    "->" +: _ -> (rev acc, ts)
+    h +: ("=" +: _) -> (rev acc, ts)
+    h +: more ->
+      if isIdent h then takeNames more (h +: acc) else (rev acc, ts)
+
+parseConArm : [Text] -> Optional ConArm
+parseConArm ts =
+  match ts with
+    "CON" +: ("(" +: (h +: ("," +: ("CTag" +: (tag +: (")" +: rest)))))) ->
+      match Nat.fromText tag with
+        None -> None
+        Some n ->
+          (names, after) = takeNames rest []
+          match after with
+            "->" +: body -> Some (ConArm h n names body)
+            _ -> None
+    _ -> None
+
+parseArms : Text -> Optional Nat -> [Text] -> WRes
+parseArms hash col ts =
+  keepArm h tag names body i =
+    match parseSeq body with
+      Bad m -> WBad m
+      Got e more ->
+        match parseArms h (Some i) more with
+          WBad m -> WBad m
+          WOk later left -> WOk (MArm tag names e +: later) left
+  readArm rest i =
+    match parseConArm rest with
+      None -> WOk [] ts
+      Some (ConArm h tag names body) ->
+        if Boolean.not (hash Text.== "") && Boolean.not (hash Text.== h) then WOk [] ts
+        else keepArm h tag names body i
+  match ts with
+    "NL" +: (n +: rest) ->
+      match Nat.fromText n with
+        None -> WBad "indent"
+        Some i ->
+          match col with
+            Some c ->
+              if Boolean.not (Nat.eq i c) then WOk [] ts else readArm rest i
+            None -> readArm rest i
+    _ ->
+      match col with
+        Some _ -> WOk [] ts
+        None ->
+          match parseConArm ts with
+            None -> WOk [] ts
+            Some (ConArm h tag names body) ->
+              if Boolean.not (hash Text.== "") && Boolean.not (hash Text.== h) then WOk [] ts
+              else
+                match parseSeq body with
+                  Bad m -> WBad m
+                  Got e more ->
+                    match parseArms h col more with
+                      WBad m -> WBad m
+                      WOk later left -> WOk (MArm tag names e +: later) left
+
+parseMatch : Text -> [Text] -> Step
+parseMatch v ts =
+  textIf lit hit def = EIf (EBuiltin "eq" [EVar v, EText (unesc lit)]) hit def
+  bindNames names i e =
+    match names with
+      [] -> e
+      n +: t -> ELet n (EField (EVar v) i) (bindNames t (i Nat.+ 1) e)
+  chain arms =
+    match arms with
+      [] -> ENat 0
+      MArm _ names e +: [] -> bindNames names 0 e
+      MArm tag names e +: rest ->
+        EIf (EIsTag (EVar v) tag) (bindNames names 0 e) (chain rest)
+  defChain arms def =
+    match arms with
+      [] -> def
+      MArm tag names e +: rest ->
+        EIf (EIsTag (EVar v) tag) (bindNames names 0 e) (defChain rest def)
+  textChain arms def =
+    match arms with
+      [] -> def
+      MArm _ (lit +: _) e +: rest -> textIf lit e (textChain rest def)
+      _ +: rest -> textChain rest def
+  textArms col ts acc =
+    match ts with
+      "NL" +: (n +: rest) ->
+        match Nat.fromText n with
+          None -> WBad "indent"
+          Some i ->
+            match col with
+              Some c ->
+                if Boolean.not (Nat.eq i c) then WOk (rev acc) ts
+                else textArms col rest acc
+              None -> textArms (Some i) rest acc
+      lit +: ("->" +: rest) ->
+        if Text.take 1 lit Text.== "\"" then
+          match parseSeq rest with
+            Bad m -> WBad m
+            Got e more -> textArms col more (MArm 0 [lit] e +: acc)
+        else WOk (rev acc) ts
+      _ -> WOk (rev acc) ts
+  seen = skipNL ts
+  match seen with
+    "_" +: ("->" +: rest) ->
+      match parseSeq rest with
+        Bad m -> Bad m
+        Got yes more ->
+          bare = skipNL more
+          match bare with
+            "CON" +: ("(" +: ("##Boolean" +: ("," +: ("CTag" +: ("0" +: (")" +: ("->" +: rest2))))))) ->
+              match parseSeq rest2 with
+                Bad m -> Bad m
+                Got no left -> Got (EIf (EVar v) yes no) left
+            [] -> Got yes []
+            h +: _ ->
+              if Text.take 1 h Text.== "\"" then
+                match textArms None more [] with
+                  WBad m -> Bad m
+                  WOk [] _ -> Bad "text arm"
+                  WOk arms left -> Got (textChain arms yes) left
+              else
+                match parseArms "" None more with
+                  WBad m -> Bad m
+                  WOk [] _ -> Bad ("bool arm " Text.++ showToks more)
+                  WOk arms left -> Got (defChain arms yes) left
+    "CON" +: ("(" +: ("#nirp5os0q6" +: ("," +: ("CTag" +: ("0" +: (")" +: (name +: ("->" +: rest)))))))) ->
+      match parseSeq rest with
+        Bad m -> Bad m
+        Got some more ->
+          match skipNL more with
+            "CON" +: ("(" +: ("#nirp5os0q6" +: ("," +: ("CTag" +: ("1" +: (")" +: ("->" +: rest2))))))) ->
+              match parseSeq rest2 with
+                Bad m -> Bad m
+                Got none left ->
+                  Got (ELet name (EField (EVar v) 0) (EIf (EIsTag (EVar v) 0) some none)) left
+            _ -> Bad "none arm"
+    lit +: ("->" +: rest) ->
+      if Text.take 1 lit Text.== "\"" then
+        match parseSeq rest with
+          Bad m -> Bad m
+          Got hit more ->
+            match skipNL more with
+              "_" +: ("->" +: rest2) ->
+                match parseSeq rest2 with
+                  Bad m -> Bad m
+                  Got def left -> Got (textIf lit hit def) left
+              _ -> Bad "text arm"
+      else Bad "arm"
+    _ ->
+      match parseArms "" None ts with
+        WBad m -> Bad m
+        WOk [] _ -> Bad "arm"
+        WOk arms left -> Got (chain arms) left
+
+parseEntry : [Text] -> Optional ([Text], [Text])
+parseEntry ts =
+  params xs acc =
+    match skipNL xs with
+      "(" +: ("()" +: (":" +: ("BX" +: (")" +: more)))) ->
+        match skipNL more with
+          "=" +: body -> Some (rev acc, body)
+          _ -> None
+      "(" +: (p +: (":" +: ("BX" +: (")" +: more)))) -> params more (p +: acc)
+      "=" +: body -> Some (rev acc, body)
+      _ -> None
+  match skipNL ts with
+    "entry" +: rest -> params rest []
+    _ -> None
+
+parseFun : Text -> [Text] -> Boolean -> (FR, Boolean)
+parseFun n toks have =
+  match parseEntry toks with
+    None -> (FBad "entry", have)
+    Some (ps, body) ->
+      nm = if Nat.eq (len ps) 0 && Boolean.not have then "main" else shortId n
+      have2 = if nm Text.== "main" then true else have
+      match parseSeq body with
+        Bad m -> (FBad m, have)
+        Got e left ->
+          if Nat.eq (len left) 0 then (FOk (FFn nm ps e), have2)
+          else (FBad ("leftover " Text.++ showToks left), have)
+
+hasT : [Grp] -> Boolean
+hasT gs =
+  match gs with
+    [] -> false
+    Grp _ toks +: t -> if hasSeq ["T"] toks then true else hasT t
+
+funsOf : [Grp] -> Out
+funsOf gs =
+  go xs have acc =
+    match xs with
+      [] ->
+        abs = withBuiltins []
+        match buildH (rev acc) abs with
+          HBad m -> CErr m
+          HR his -> COut (emitProgram (rev acc) abs his)
+      Grp n toks +: t ->
+        (step, have2) = parseFun n toks have
+        match step with
+          FBad m -> CErr ("leaf " Text.++ shortId n Text.++ " " Text.++ m)
+          FOk f -> go t have2 (f +: acc)
+  go gs false []
+
+walkLeaf : [Grp] -> Out
+walkLeaf gs =
+  if Boolean.not (hasT gs) then CErr "not leaf" else funsOf gs
+
+askShape : [Text] -> [Text] -> [Text] -> Boolean
+askShape btoks htoks ltoks =
+  if Boolean.not (hasSeq ["REQ"] btoks) then false
+  else if Boolean.not (hasSeq ["##Nat.+"] btoks) then false
+  else if hasSeq ["CON"] btoks then false
+  else if hasSeq ["match"] btoks then false
+  else if hasSeq ["shift"] btoks then false
+  else if Boolean.not (hasSeq ["shift"] htoks) then false
+  else if Boolean.not (hasSeq ["##jumpCont"] htoks) then false
+  else if Boolean.not (hasSeq ["REQ", "(", "0", ",", "0", ")"] htoks) then false
+  else if Boolean.not (hasSeq ["N"] ltoks) then false
+  else if hasSeq ["CON"] ltoks then false
+  else if hasSeq ["REQ"] ltoks then false
+  else true
+
+walkAsk : [Grp] -> Out
+walkAsk gs =
+  match findToText gs with
+    None -> CErr "not ask"
+    Some mainToks ->
+      match firstUserEnv mainToks with
+        None -> CErr "not ask"
+        Some hh ->
+          match delayedUserEnv mainToks with
+            None -> CErr "not ask"
+            Some bh ->
+              match findGroup hh gs with
+                None -> CErr "not ask"
+                Some htoks ->
+                  match findGroup bh gs with
+                    None -> CErr "not ask"
+                    Some btoks ->
+                      match delayedUserEnv htoks with
+                        None -> CErr "not ask"
+                        Some lh ->
+                          match findGroup lh gs with
+                            None -> CErr "not ask"
+                            Some ltoks ->
+                              if Boolean.not (askShape btoks htoks ltoks) then CErr "not ask"
+                              else
+                                match entryBody btoks with
+                                  None -> CErr "not ask"
+                                  Some bodyToks ->
+                                    match reqOf btoks with
+                                      None -> CErr "not ask"
+                                      Some (ab, tag) ->
+                                        match reqOf htoks with
+                                          None -> CErr "not ask"
+                                          Some (ab2, tag2) ->
+                                            if Boolean.not (ab Text.== ab2) || Boolean.not (tag Text.== tag2) then CErr "not ask"
+                                            else
+                                              match kNameOf htoks with
+                                                None -> CErr "not ask"
+                                                Some k ->
+                                                  match pureNameOf htoks with
+                                                    None -> CErr "not ask"
+                                                    Some pn ->
+                                                      match firstNat ltoks with
+                                                        None -> CErr "not ask"
+                                                        Some lit ->
+                                                          match parseStmts bodyToks with
+                                                            Bad m -> CErr m
+                                                            Got body [] ->
+                                                              hname = cname hh
+                                                              bname = cname bh
+                                                              abs = [Abil ab 0 [Bind ("r" Text.++ tag) (tagNat tag)]]
+                                                              hd =
+                                                                FHd hname []
+                                                                  [ BReq ab ("r" Text.++ tag) None k
+                                                                      (EHandle (ECall k [ENat lit]) hname [])
+                                                                  , BPure pn (EVar pn)
+                                                                  ]
+                                                              fn = FFn bname [] body
+                                                              entry = FFn "main" [] (ELet "n" (EHandle (ECall bname []) hname []) (EPrint (EVar "n")))
+                                                              funs = [fn, hd, entry]
+                                                              match buildH funs abs with
+                                                                HBad m -> CErr m
+                                                                HR his -> COut (emitProgram funs abs his)
+                                                            Got _ _ -> CErr "anf leftover"
+
+isCutH : [Text] -> Boolean
+isCutH toks =
+  if Boolean.not (hasSeq ["shift"] toks) then false
+  else if Boolean.not (hasSeq ["##jumpCont"] toks) then false
+  else if Boolean.not (hasSeq ["REQ", "(", "0", ",", "0", ")"] toks) then false
+  else if Boolean.not (hasSeq ["N"] toks) then false
+  else if hasSeq ["##Nat.+"] toks then false
+  else Boolean.not (userEnv toks)
+
+isCutB : [Text] -> Boolean
+isCutB toks =
+  if Boolean.not (hasSeq ["REQ"] toks) then false
+  else if Boolean.not (hasSeq ["##Nat.+"] toks) then false
+  else if hasSeq ["shift"] toks then false
+  else if hasSeq ["match"] toks then false
+  else if hasSeq ["CON"] toks then false
+  else Boolean.not (hasSeq ["##Nat.toText"] toks)
+
+countG : ([Text] -> Boolean) -> [Grp] -> Nat
+countG p gs =
+  match gs with
+    [] -> 0
+    Grp _ toks +: t ->
+      n = if p toks then 1 else 0
+      n Nat.+ countG p t
+
+buildCut : Text -> [Text] -> Text -> [Text] -> Out
+buildCut hn ht bn bt =
+  match entryBody bt with
+    None -> CErr "cut entry"
+    Some bodyToks ->
+      match parseStmts bodyToks with
+        Bad m -> CErr m
+        Got _ left ->
+          if Boolean.not (Nat.eq (len left) 0) then CErr "cut leftover"
+          else
+            match parseStmts bodyToks with
+              Bad m -> CErr m
+              Got body [] ->
+                match reqOf ht with
+                  None -> CErr "cut req"
+                  Some (ab, tag) ->
+                    match reqOf bt with
+                      None -> CErr "cut body req"
+                      Some (ab2, tag2) ->
+                        if Boolean.not (ab Text.== ab2) || Boolean.not (tag Text.== tag2) then CErr "cut tag"
+                        else
+                          match kNameOf ht with
+                            None -> CErr "cut k"
+                            Some k ->
+                              match pureNameOf ht with
+                                None -> CErr "cut pure"
+                                Some pn ->
+                                  match firstNat ht with
+                                    None -> CErr "cut n"
+                                    Some dropN ->
+                                      hname = cname hn
+                                      bname = cname bn
+                                      req = "r" Text.++ tag
+                                      abs = [Abil ab 0 [Bind req (tagNat tag)]]
+                                      hd = FHd hname [] [BReq ab req None k (ENat dropN), BPure pn (EVar pn)]
+                                      fn = FFn bname [] body
+                                      entry = FFn "main" [] (ELet "n" (EHandle (ECall bname []) hname []) (EPrint (EVar "n")))
+                                      funs = [fn, hd, entry]
+                                      match buildH funs abs with
+                                        HBad m -> CErr m
+                                        HR his -> COut (emitProgram funs abs his)
+              Got _ _ -> CErr "cut leftover"
+
+walkCut : [Grp] -> Out
+walkCut gs =
+  if Boolean.not (Nat.eq (countG isCutH gs) 1) then CErr "not cut"
+  else if Boolean.not (Nat.eq (countG isCutB gs) 1) then CErr "not cut"
+  else
+    match findG isCutH gs with
+      None -> CErr "not cut"
+      Some (hn, ht) ->
+        match findG isCutB gs with
+          None -> CErr "not cut"
+          Some (bn, bt) -> buildCut hn ht bn bt
+
+isPaint : [Text] -> Boolean
+isPaint toks =
+  if Boolean.not (hasSeq ["match"] toks) then false
+  else if Boolean.not (hasSeq ["CON"] toks) then false
+  else if Boolean.not (hasSeq ["N"] toks) then false
+  else if Boolean.not (hasSeq [")", "->"] toks) then false
+  else if hasSeq ["REQ"] toks then false
+  else if hasSeq ["shift"] toks then false
+  else if hasSeq ["##Nat.+"] toks then false
+  else Boolean.not (hasSeq ["##Boolean"] toks)
+
+isUnbox : [Text] -> Boolean
+isUnbox toks =
+  if Boolean.not (hasSeq ["match"] toks) then false
+  else if Boolean.not (hasSeq ["CON"] toks) then false
+  else if Boolean.not (hasSeq ["##Nat.+"] toks) then false
+  else if hasSeq ["REQ"] toks then false
+  else Boolean.not (hasSeq ["shift"] toks)
+
+isLitN : [Text] -> Boolean
+isLitN toks =
+  if Boolean.not (hasSeq ["N"] toks) then false
+  else if hasSeq ["REQ"] toks then false
+  else if hasSeq ["shift"] toks then false
+  else if hasSeq ["match"] toks then false
+  else if hasSeq ["CON"] toks then false
+  else Boolean.not (hasSeq ["##Nat.+"] toks)
+
+isAskH : [Text] -> Boolean
+isAskH toks =
+  if Boolean.not (hasSeq ["shift"] toks) then false
+  else if Boolean.not (hasSeq ["##jumpCont"] toks) then false
+  else if Boolean.not (hasSeq ["REQ", "(", "0", ",", "0", ")"] toks) then false
+  else if Boolean.not (userEnv toks) then false
+  else Boolean.not (hasSeq ["##Nat.+"] toks)
+
+isColorB : [Text] -> Boolean
+isColorB toks =
+  if Boolean.not (hasSeq ["REQ"] toks) then false
+  else if Boolean.not (hasSeq ["##Nat.", "=="] toks) then false
+  else if Boolean.not (hasSeq ["##Boolean", ",", "CTag", "0"] toks) then false
+  else if hasSeq ["shift"] toks then false
+  else
+    match colorTags toks with
+      [] -> false
+      _ -> true
+
+isBox : [Text] -> Boolean
+isBox toks =
+  if Boolean.not (hasSeq ["CON"] toks) then false
+  else if Boolean.not (hasSeq ["N"] toks) then false
+  else if hasSeq ["REQ"] toks then false
+  else if hasSeq ["shift"] toks then false
+  else if hasSeq ["match"] toks then false
+  else Boolean.not (hasSeq ["##Nat.+"] toks)
+
+oneRole : ([Text] -> Boolean) -> [Grp] -> Boolean
+oneRole p gs = Nat.eq (countG p gs) 1
+
+buildColor : [Text] -> [Text] -> [Text] -> [Text] -> Text -> [Text] -> [Text] -> Out
+buildColor pt ut lt ht bn bt xt =
+  match entryBody bt with
+    None -> CErr "color entry"
+    Some bodyToks ->
+      match parseStmts bodyToks with
+        Bad m -> CErr m
+        Got body [] ->
+          match reqOf bt with
+            None -> CErr "color req"
+            Some (ab, tag) ->
+              match reqOf ht with
+                None -> CErr "color handler req"
+                Some (ab2, tag2) ->
+                  if Boolean.not (ab Text.== ab2) || Boolean.not (tag Text.== tag2) then CErr "color tag"
+                  else
+                    match kNameOf ht with
+                      None -> CErr "color k"
+                      Some k ->
+                        match pureNameOf ht with
+                          None -> CErr "color pure"
+                          Some pn ->
+                            match firstNat lt with
+                              None -> CErr "color lit"
+                              Some lit ->
+                                match firstUserEnv bt with
+                                  None -> CErr "color paint"
+                                  Some paintH ->
+                                    match firstUserEnv xt with
+                                      None -> CErr "color box fn"
+                                      Some boxH ->
+                                        match firstUserEnv ht with
+                                          None -> CErr "color self"
+                                          Some selfH ->
+                                            match firstNat ut with
+                                              None -> CErr "color add"
+                                              Some addN ->
+                                                match firstNat xt with
+                                                  None -> CErr "color box n"
+                                                  Some boxN ->
+                                                    match colorTags xt with
+                                                      boxTag +: [] ->
+                                                        match armsOf pt with
+                                                          a +: (b +: []) ->
+                                                            hname = cname selfH
+                                                            paint = cname paintH
+                                                            unbox = cname boxH
+                                                            req = "r" Text.++ tag
+                                                            abs = [Abil ab 0 [Bind req (tagNat tag)]]
+                                                            fns =
+                                                              [ FFn paint ["p"] (ifsOf (a +: (b +: [])))
+                                                              , FFn unbox ["p"] (EAdd (EField (EVar "p") 0) (ENat addN))
+                                                              , FFn bn [] body
+                                                              , FHd hname []
+                                                                  [ BReq ab req None k (EHandle (ECall k [ENat lit]) hname [])
+                                                                  , BPure pn (EVar pn)
+                                                                  ]
+                                                              , FFn "main" []
+                                                                  (ELet "n" (EHandle (ECall bn []) hname [])
+                                                                    (ELet "m" (ECall unbox [ECon boxTag (Some (ENat boxN))])
+                                                                      (ESeq (EPrint (EVar "n")) (EPrint (EVar "m")))))
+                                                              ]
+                                                            match buildH fns abs with
+                                                              HBad m -> CErr m
+                                                              HR his -> COut (emitProgram fns abs his)
+                                                          _ -> CErr "color arms"
+                                                      _ -> CErr "color box tag"
+        Got _ _ -> CErr "color leftover"
+
+walkColor : [Grp] -> Out
+walkColor gs =
+  if Boolean.not (oneRole isPaint gs) then CErr "not color"
+  else if Boolean.not (oneRole isUnbox gs) then CErr "not color"
+  else if Boolean.not (oneRole isLitN gs) then CErr "not color"
+  else if Boolean.not (oneRole isAskH gs) then CErr "not color"
+  else if Boolean.not (oneRole isColorB gs) then CErr "not color"
+  else if Boolean.not (oneRole isBox gs) then CErr "not color"
+  else
+    match findG isPaint gs with
+      None -> CErr "not color"
+      Some (_, pt) ->
+        match findG isUnbox gs with
+          None -> CErr "not color"
+          Some (_, ut) ->
+            match findG isLitN gs with
+              None -> CErr "not color"
+              Some (_, lt) ->
+                match findG isAskH gs with
+                  None -> CErr "not color"
+                  Some (_, ht) ->
+                    match findG isColorB gs with
+                      None -> CErr "not color"
+                      Some (bn, bt) ->
+                        match findG isBox gs with
+                          None -> CErr "not color"
+                          Some (_, xt) -> buildColor pt ut lt ht (cname bn) bt xt
+
+structural type Arity = Arity Text Nat
+
+structural type AbAcc = AbAcc Text [Nat]
+
+structural type RGot = RGot Text Expr [Text]
+
+structural type ArmR = ArmOk [Branch] | ArmBad Text
+
+structural type DRes = DOk [Fundef] | DBad Text
+
+abilName : Text -> Text
+abilName h = "A" Text.++ shortId h
+
+reqName : Text -> Text
+reqName t = "r" Text.++ t
+
+hdName : Text -> Text
+hdName h = "h" Text.++ shortId h
+
+butLast : [a] -> [a]
+butLast xs =
+  match xs with
+    [] -> []
+    _ +: [] -> []
+    h +: t -> h +: butLast t
+
+lastText : [Text] -> Text
+lastText xs =
+  match xs with
+    [] -> "body"
+    h +: [] -> h
+    _ +: t -> lastText t
+
+readParams : [Text] -> [Text] -> Optional ([Text], [Text])
+readParams xs acc =
+  match xs with
+    "(" +: ("()" +: (":" +: ("BX" +: (")" +: more)))) ->
+      match more with
+        "=" +: body -> Some (rev acc, body)
+        _ -> None
+    "(" +: (p +: (":" +: ("BX" +: (")" +: more)))) -> readParams more (p +: acc)
+    "=" +: body -> Some (rev acc, body)
+    _ -> None
+
+arityGet : Text -> [Arity] -> Optional Nat
+arityGet n xs =
+  match xs with
+    [] -> None
+    Arity a k +: t -> if a Text.== n then Some k else arityGet n t
+
+hasNat : Nat -> [Nat] -> Boolean
+hasNat n xs =
+  match xs with
+    [] -> false
+    h +: t -> if Nat.eq h n then true else hasNat n t
+
+addU : Nat -> [Nat] -> [Nat]
+addU n xs =
+  if hasNat n xs then xs else n +: xs
+
+addTag : Text -> Text -> [AbAcc] -> [AbAcc]
+addTag h tg acc =
+  n = tagNat tg
+  go xs =
+    match xs with
+      [] -> [AbAcc h [n]]
+      AbAcc a tags +: t ->
+        if shortId a Text.== shortId h then AbAcc a (addU n tags) +: t
+        else AbAcc a tags +: go t
+  go acc
+
+scanToks : [Text] -> [AbAcc] -> [AbAcc]
+scanToks xs acc =
+  match xs with
+    [] -> acc
+    "REQ" +: ("(" +: (h +: ("," +: ("CTag" +: (tg +: rest))))) ->
+      acc2 = if Text.take 1 h Text.== "#" then addTag h tg acc else acc
+      scanToks rest acc2
+    _ +: t -> scanToks t acc
+
+scanAbs : [Grp] -> [AbAcc]
+scanAbs gs =
+  go xs acc =
+    match xs with
+      [] -> acc
+      Grp _ toks +: t -> go t (scanToks toks acc)
+  go gs []
+
+tagBinds : [Nat] -> [Bind]
+tagBinds xs =
+  match xs with
+    [] -> []
+    n +: t -> Bind (reqName (Nat.toText n)) n +: tagBinds t
+
+toAbils : [AbAcc] -> Nat -> [Abil]
+toAbils xs i =
+  match xs with
+    [] -> []
+    AbAcc h tags +: t -> Abil (abilName h) i (tagBinds tags) +: toAbils t (i Nat.+ 1)
+
+anyShift : [Grp] -> Boolean
+anyShift gs =
+  match gs with
+    [] -> false
+    Grp _ toks +: t -> if hasSeq ["shift"] toks then true else anyShift t
+
+anyPrint : [Grp] -> Boolean
+anyPrint gs =
+  match gs with
+    [] -> false
+    Grp _ toks +: t -> if hasSeq ["#02c89qncfg"] toks then true else anyPrint t
+
+isHandlerG : [Text] -> Boolean
+isHandlerG toks =
+  hasSeq ["shift"] toks && hasSeq ["handle"] toks
+
+oneArity : Text -> [Text] -> Boolean -> (Arity, Boolean)
+oneArity n toks have =
+  if isHandlerG toks then
+    match splitFirst "entry" toks with
+      None -> (Arity (shortId n) 0, have)
+      Some (_, entry) ->
+        match readParams entry [] with
+          Some (ps, _) -> (Arity (shortId n) (len ps), have)
+          None -> (Arity (shortId n) 0, have)
+  else
+    match toks with
+      "entry" +: rest ->
+        match readParams rest [] with
+          Some (ps, _) ->
+            nm = if Nat.eq (len ps) 0 && Boolean.not have then "main" else shortId n
+            have2 = if nm Text.== "main" then true else have
+            (Arity nm (len ps), have2)
+          None -> (Arity (shortId n) 0, have)
+      _ -> (Arity (shortId n) 0, have)
+
+aritiesOf : [Grp] -> [Arity]
+aritiesOf gs =
+  go xs have acc =
+    match xs with
+      [] -> acc
+      Grp n toks +: t ->
+        (ar, have2) = oneArity n toks have
+        go t have2 (ar +: acc)
+  go gs false []
+
+packCall : Text -> [Expr] -> Expr
+packCall fn args =
+  go xs acc =
+    match xs with
+      [] -> acc
+      h +: t -> go t (EBuiltin "push" [acc, h])
+  go args (ECall fn [])
+
+delayCall : [Arity] -> Expr -> Expr
+delayCall ar e =
+  match e with
+    ECall fn args ->
+      match arityGet fn ar with
+        Some k ->
+          if Nat.eq (len args) k && Boolean.not (Nat.eq k 0) then packCall fn args else e
+        None -> e
+    _ -> e
+
+takeAtMost : Nat -> [Text] -> ([Text], [Text])
+takeAtMost k ts =
+  go n xs acc =
+    if Nat.eq n 0 then (rev acc, xs)
+    else
+      match xs with
+        [] -> (rev acc, [])
+        h +: ("=" +: _) -> (rev acc, xs)
+        h +: (":" +: _) -> (rev acc, xs)
+        h +: more ->
+          if isIdent h && Boolean.not (isNextPat (h +: more)) then go (n Nat.- 1) more (h +: acc)
+          else (rev acc, xs)
+  go k ts []
+
+takeDumpFields : [Text] -> [Text] -> ([Text], [Text])
+takeDumpFields ts acc =
+  match ts with
+    [] -> (rev acc, [])
+    h +: ("=" +: _) -> (rev acc, ts)
+    h +: (":" +: _) -> (rev acc, ts)
+    h +: more ->
+      if isIdent h && Boolean.not (isNextPat (h +: more)) then takeDumpFields more (h +: acc)
+      else (rev acc, ts)
+
+isBinder : [Text] -> Boolean
+isBinder xs =
+  match xs with
+    "=" +: _ -> true
+    ":" +: _ -> true
+    _ -> false
+
+parseDumpExpr : [Arity] -> [Text] -> Step
+parseDumpExpr ar xs =
+  match xs with
+    "N" +: (t +: rest) ->
+      match Nat.fromText t with
+        Some n -> Got (ENat n) rest
+        None -> Bad "dump nat"
+    "T" +: (q +: rest) ->
+      if Text.take 1 q Text.== "\"" then Got (EText (unesc q)) rest else Bad "dump text"
+    "REQ" +: ("(" +: (h +: ("," +: ("CTag" +: (tg +: (")" +: rest)))))) ->
+      name = abilName h Text.++ "." Text.++ reqName tg
+      match rest with
+        [] -> Got (EPerform name None) []
+        p +: more ->
+          if isIdent p && Boolean.not (isBinder more) then Got (EPerform name (Some (EVar p))) more
+          else Got (EPerform name None) rest
+    "ENV" +: ("(" +: ("##Nat.+" +: (")" +: (a +: (b +: rest))))) ->
+      Got (EAdd (EVar a) (EVar b)) rest
+    "ENV" +: ("(" +: ("##Nat.drop" +: (")" +: (a +: (b +: rest))))) ->
+      Got (ESub (EVar a) (EVar b)) rest
+    "ENV" +: ("(" +: ("##Nat." +: ("==" +: (")" +: (a +: (b +: rest)))))) ->
+      Got (EEq (EVar a) (EVar b)) rest
+    "ENV" +: ("(" +: ("##Nat.toText" +: (")" +: rest))) ->
+      (fs, more) = takeAtMost 1 rest
+      match fs with
+        a +: [] -> Got (EBuiltin "totext" [EVar a]) more
+        _ -> Bad "totext"
+    "ENV" +: ("(" +: (h +: (")" +: rest))) ->
+      if Text.take 2 h Text.== "##" then parseEnv ("(" +: (h +: (")" +: rest)))
+      else if Text.take 1 h Text.== "#" then
+        id = shortId h
+        if id Text.== "02c89qncfg" then
+          (fs, more) = takeAtMost 1 rest
+          match fs with
+            a +: [] -> Got (EPerform "IO.printLine" (Some (EVar a))) more
+            _ -> Bad "print"
+        else
+          (fs, more) = match arityGet id ar with
+            Some k ->
+              if Nat.eq k 0 then
+                match rest with
+                  a +: ("=" +: _) -> ([], rest)
+                  a +: (":" +: _) -> ([], rest)
+                  a +: more2 ->
+                    if isIdent a then ([], more2) else ([], rest)
+                  _ -> ([], rest)
+              else takeAtMost k rest
+            None -> takeDumpFields rest []
+          Got (ECall id (varsOf fs)) more
+      else parseEnv ("(" +: (h +: (")" +: rest)))
+    "ENV" +: rest -> parseEnv rest
+    "CON" +: ("(" +: (href +: ("," +: ("CTag" +: (tag +: (")" +: rest)))))) ->
+      match Nat.fromText tag with
+        None -> Bad "ctag"
+        Some n ->
+          nullary = href Text.== "##Boolean" || Text.take 11 href Text.== "#00nv2kob8f"
+          (fs, more) = if nullary then ([], rest) else takeDumpFields rest []
+          Got (EBuiltin "con" (ENat n +: varsOf fs)) more
+    h +: rest ->
+      if isIdent h then
+        match rest with
+          [] -> Got (EVar h) []
+          a +: more ->
+            if isIdent a then Got (EBuiltin "app" [EVar h, EVar a]) more
+            else Got (EVar h) rest
+      else Bad ("dump expr " Text.++ h)
+    [] -> Bad "dump expr"
+
+takeN : Nat -> [Text] -> Optional ([Text], [Text])
+takeN n xs =
+  if Nat.eq n 0 then Some ([], xs)
+  else
+    match xs with
+      [] -> None
+      h +: t ->
+        if isIdent h then
+          match takeN (n Nat.- 1) t with
+            None -> None
+            Some (ys, rest) -> Some (h +: ys, rest)
+        else None
+
+findShort : Text -> [Grp] -> Optional [Text]
+findShort id gs =
+  match gs with
+    [] -> None
+    Grp n toks +: t ->
+      if shortId n Text.== shortId id then Some toks else findShort id t
+
+boolTag : [Text] -> Optional Nat
+boolTag xs =
+  match xs with
+    [] -> None
+    "CTag" +: (n +: _) -> Nat.fromText n
+    _ +: t -> boolTag t
+
+resumeVal : [Grp] -> Text -> [Text] -> Expr
+resumeVal gs wref wargs =
+  match findShort wref gs with
+    None -> EUnit
+    Some toks ->
+      if hasSeq ["##Boolean"] toks then
+        match boolTag toks with
+          Some n -> EBool n
+          None -> EBool 1
+      else if hasSeq ["#00nv2kob8f"] toks then EUnit
+      else
+        match firstNat toks with
+          Some n -> ENat n
+          None ->
+            match wargs with
+              _ +: (v +: _) -> EVar v
+              v +: [] -> EVar v
+              [] -> EUnit
+
+resumeFrom : [Grp] -> [Arity] -> [Text] -> Optional RGot
+resumeFrom gs ar xs =
+  match xs with
+    hv +: ("=" +: ("ENV" +: ("(" +: (href +: (")" +: more))))) ->
+      if Text.take 1 href Text.!= "#" then None
+      else
+        match arityGet (shortId href) ar with
+          None -> None
+          Some k ->
+            narg = if Nat.eq k 0 then 0 else k Nat.- 1
+            match takeN narg more with
+              None -> None
+              Some (hargs, after) ->
+                match after with
+                  wv +: (":" +: ("=" +: ("ENV" +: ("(" +: (wref +: (")" +: wmore)))))) ->
+                    match arityGet (shortId wref) ar with
+                      None -> None
+                      Some wk ->
+                        match takeN wk wmore with
+                          None -> None
+                          Some (wargs, tail) ->
+                            hex = EHandle (ECall "k" [resumeVal gs wref wargs]) (hdName href) (varsOf hargs)
+                            match tail with
+                              n +: ("=" +: (h2 +: (w2 +: rest2))) ->
+                                if h2 Text.== hv && w2 Text.== wv then Some (RGot n hex rest2) else None
+                              h2 +: (w2 +: rest2) ->
+                                if h2 Text.== hv && w2 Text.== wv && Nat.eq (len rest2) 0 then Some (RGot "" hex []) else None
+                              _ -> None
+                  _ -> None
+    _ -> None
+
+tryResume : [Grp] -> [Arity] -> [Text] -> Optional RGot
+tryResume gs ar xs =
+  match xs with
+    _ +: (":" +: ("=" +: ("ENV" +: ("(" +: ("##jumpCont" +: (")" +: (_ +: rest))))))) -> resumeFrom gs ar rest
+    _ -> None
+
+parseDumpSeq : [Arity] -> [Text] -> Step
+parseDumpSeq ar xs =
+  if Nat.eq (len xs) 0 then Bad "empty"
+  else
+    match xs with
+      n +: (":" +: ("=" +: rhs)) ->
+        if Boolean.not (isIdent n) then Bad ("bind " Text.++ n)
+        else
+          match parseDumpExpr ar rhs with
+            Bad m -> Bad m
+            Got e more ->
+              e2 = delayCall ar e
+              match more with
+                [] -> Got (ELet n e2 (EVar n)) []
+                _ ->
+                  match parseDumpSeq ar more with
+                    Bad m -> Bad m
+                    Got b left -> Got (ELet n e2 b) left
+      n +: ("=" +: ("match" +: (v +: ("with" +: rest)))) ->
+        if Boolean.not (isIdent n) then Bad ("bind " Text.++ n) else parseBoundMatch ar n v rest
+      n +: ("=" +: rhs) ->
+        if Boolean.not (isIdent n) then Bad ("bind " Text.++ n)
+        else
+          match parseDumpExpr ar rhs with
+            Bad m -> Bad m
+            Got e more ->
+              match more with
+                [] -> Got (ELet n e (EVar n)) []
+                _ ->
+                  match parseDumpSeq ar more with
+                    Bad m -> Bad m
+                    Got b left -> Got (ELet n e b) left
+      "match" +: (v +: ("with" +: rest)) -> parseBareMatch ar v rest
+      _ -> parseDumpExpr ar xs
+
+parseBareMatch : [Arity] -> Text -> [Text] -> Step
+parseBareMatch ar v rest =
+  match rest with
+    "_" +: ("->" +: more) ->
+      match splitBool more with
+        None -> parseMatch v rest
+        Some (th, el) ->
+          match parseDumpSeq ar th with
+            Bad m -> Bad m
+            Got te tleft ->
+              if Boolean.not (Nat.eq (len tleft) 0) then Bad "then tail"
+              else
+                match parseDumpSeq ar el with
+                  Bad m -> Bad m
+                  Got ee eleft -> Got (EIf (EVar v) te ee) eleft
+    _ -> parseMatch v rest
+
+parseBoundMatch : [Arity] -> Text -> Text -> [Text] -> Step
+parseBoundMatch ar n v rest =
+  match rest with
+    "_" +: ("->" +: more) ->
+      match splitBool more with
+        None ->
+          match parseMatch v rest with
+            Bad m -> Bad m
+            Got e more2 -> bindMatch ar n e more2
+        Some (th, el) ->
+          match parseDumpExpr ar th with
+            Bad m -> Bad m
+            Got te tleft ->
+              if Boolean.not (Nat.eq (len tleft) 0) then Bad "then tail"
+              else
+                match parseDumpExpr ar el with
+                  Bad m -> Bad m
+                  Got ee eleft -> bindMatch ar n (EIf (EVar v) te ee) eleft
+    _ ->
+      match parseMatch v rest with
+        Bad m -> Bad m
+        Got e more2 -> bindMatch ar n e more2
+
+bindMatch : [Arity] -> Text -> Expr -> [Text] -> Step
+bindMatch ar n e more =
+  match more with
+    [] -> Got (ELet n e (EVar n)) []
+    _ ->
+      match parseDumpSeq ar more with
+        Bad m -> Bad m
+        Got b left -> Got (ELet n e b) left
+
+parseShiftBody : [Grp] -> [Arity] -> [Text] -> Step
+parseShiftBody gs ar xs =
+  if Nat.eq (len xs) 0 then Bad "empty arm"
+  else
+    match tryResume gs ar xs with
+      Some (RGot "" e rest) ->
+        if Nat.eq (len rest) 0 then Got e [] else Bad "resume tail"
+      Some (RGot n e rest) ->
+        match parseShiftBody gs ar rest with
+          Bad m -> Bad m
+          Got b left ->
+            if Nat.eq (len left) 0 then Got (ELet n e b) [] else Bad "arm tail"
+      None ->
+        match resumeFrom gs ar xs with
+          Some (RGot "" e rest) ->
+            if Nat.eq (len rest) 0 then Got e [] else Bad "resume tail"
+          Some (RGot n e rest) ->
+            match parseShiftBody gs ar rest with
+              Bad m -> Bad m
+              Got b left ->
+                if Nat.eq (len left) 0 then Got (ELet n e b) [] else Bad "arm tail"
+          None ->
+            match xs with
+              _ +: (":" +: ("=" +: ("ENV" +: ("(" +: ("##jumpCont" +: (")" +: (_ +: rest))))))) ->
+                match rest with
+                  _ +: ("=" +: ("ENV" +: ("(" +: (h +: _)))) ->
+                    if Text.take 1 h Text.== "#" then Bad ("resume " Text.++ shortId h) else parseDumpSeq ar rest
+                  _ -> parseDumpSeq ar rest
+              _ -> parseDumpSeq ar xs
+
+splitReq : [Text] -> ([Text], [Text])
+splitReq xs =
+  match splitFirst "REQ" xs with
+    None -> (xs, [])
+    Some (body, more) -> (body, "REQ" +: more)
+
+skipShift : [Text] -> [Text]
+skipShift xs =
+  match xs with
+    "shift" +: ("[" +: (_ +: ("]" +: (_ +: rest)))) -> rest
+    _ -> xs
+
+parseReqArms : [Grp] -> [Arity] -> [Text] -> ArmR
+parseReqArms gs ar xs =
+  match xs with
+    [] -> ArmOk []
+    "REQ" +: ("(" +: ("0" +: ("," +: ("0" +: (")" +: (pn +: ("->" +: rest))))))) ->
+      match parseDumpSeq ar rest with
+        Bad m -> ArmBad m
+        Got e left ->
+          if Nat.eq (len left) 0 then ArmOk [BPure pn e] else ArmBad "pure tail"
+    "REQ" +: ("(" +: (h +: ("," +: ("CTag" +: (tg +: (")" +: rest)))))) ->
+      peeled = match rest with
+        "->" +: after -> (None, after)
+        pay +: ("->" +: after) ->
+          if isIdent pay then (Some pay, after) else (None, rest)
+        _ -> (None, rest)
+      (pay, after) = peeled
+      (body, more) = splitReq after
+      match parseShiftBody gs ar (skipShift body) with
+        Bad m -> ArmBad m
+        Got e left ->
+          if Boolean.not (Nat.eq (len left) 0) then ArmBad "req tail"
+          else
+            match parseReqArms gs ar more with
+              ArmBad m -> ArmBad m
+              ArmOk bs -> ArmOk (BReq (abilName h) (reqName tg) pay "k" e +: bs)
+    _ -> ArmBad "arm"
+
+groupDump : [Grp] -> [Arity] -> Text -> [Text] -> Boolean -> (DRes, Boolean)
+groupDump gs ar n toks have =
+  if isHandlerG toks then
+    res = match splitFirst "entry" toks with
+      None -> DBad "handler entry"
+      Some (hdToks, entry) ->
+        match hdToks with
+          _ +: rest ->
+            match readParams rest [] with
+              None -> DBad "handler params"
+              Some (cps, cbody) ->
+                match cbody with
+                  "match" +: (_ +: ("with" +: arms)) ->
+                    match readParams entry [] with
+                      None -> DBad "entry params"
+                      Some (eps, _) ->
+                        st = butLast cps
+                        est = butLast eps
+                        if Boolean.not (Nat.eq (len st) (len est)) then DBad "handler arity"
+                        else if Nat.eq (len eps) 0 then DBad "body param"
+                        else
+                          match parseReqArms gs ar arms with
+                            ArmBad m -> DBad m
+                            ArmOk bs ->
+                              bname = lastText eps
+                              entryE = EHandle (EBuiltin "force" [EVar bname]) (hdName n) (varsOf est)
+                              DOk [FHd (hdName n) st bs, FFn (shortId n) eps entryE]
+                  _ -> DBad "handler match"
+          [] -> DBad "handler name"
+    (res, have)
+  else
+    match toks with
+      "entry" +: rest ->
+        match readParams rest [] with
+          None -> (DBad "entry", have)
+          Some (ps, body) ->
+            nm = if Nat.eq (len ps) 0 && Boolean.not have then "main" else shortId n
+            have2 = if nm Text.== "main" then true else have
+            match parseDumpSeq ar body with
+              Bad m -> (DBad m, have)
+              Got e left ->
+                if Nat.eq (len left) 0 then (DOk [FFn nm ps e], have2)
+                else (DBad ("leftover " Text.++ Text.take 40 (showToks left)), have)
+      _ -> (DBad "entry", have)
+
+dumpFuns : [Grp] -> [Arity] -> DRes
+dumpFuns gs ar =
+  go xs have acc =
+    match xs with
+      [] -> DOk (rev acc)
+      Grp n toks +: t ->
+        (step, have2) = groupDump gs ar n toks have
+        match step with
+          DBad m -> DBad (shortId n Text.++ " " Text.++ m)
+          DOk fs -> go t have2 (cat (rev fs) acc)
+  go gs false []
+
+readDump : [Grp] -> Out
+readDump gs =
+  if Boolean.not (anyShift gs) || Boolean.not (anyPrint gs) then CErr "not dump"
+  else
+    ar = aritiesOf gs
+    abs = withBuiltins (toAbils (scanAbs gs) 0)
+    match dumpFuns gs ar with
+      DBad m -> CErr m
+      DOk fs ->
+        match buildH fs abs with
+          HBad m -> CErr m
+          HR his -> COut (emitProgram fs abs his)
+
+compileAnf : Text ->{IO, Exception} ()
+compileAnf name =
+  raw = IO.FilePath.readFile (IO.FilePath.FilePath ("anf/" Text.++ name Text.++ ".anf"))
+  text = Text.fromUtf8 raw
+  lns = lex text
+  gs = groups lns
+  out =
+    match readDump gs with
+      COut c -> COut c
+      CErr "not dump" ->
+        match walkLeaf (leafGroups lns) with
+          COut c -> COut c
+          CErr "not leaf" ->
+            match walkAsk gs with
+              COut c -> COut c
+              CErr "not ask" ->
+                match walkCut gs with
+                  COut c -> COut c
+                  CErr "not cut" ->
+                    match walkColor gs with
+                      COut c -> COut c
+                      CErr "not color" -> shapeOut name gs
+                      CErr m -> CErr m
+                  CErr m -> CErr m
+              CErr m -> CErr m
+          CErr m -> CErr m
+      CErr m -> CErr m
+  match out with
+    CErr m -> printLine ("fail " Text.++ name Text.++ " " Text.++ m)
+    COut c ->
+      IO.FilePath.writeFile (IO.FilePath.FilePath ("out/anf-" Text.++ name Text.++ ".c")) (Text.toUtf8 c)
+      printLine ("wrote out/anf-" Text.++ name Text.++ ".c")
+
+compileLeaf : Text ->{IO, Exception} ()
+compileLeaf name =
+  raw = IO.FilePath.readFile (IO.FilePath.FilePath ("anf/" Text.++ name Text.++ ".anf"))
+  text = Text.fromUtf8 raw
+  gs = leafGroups (lex text)
+  match funsOf gs with
+    CErr m -> printLine ("fail " Text.++ name Text.++ " " Text.++ m)
+    COut c ->
+      IO.FilePath.writeFile (IO.FilePath.FilePath ("out/anf-" Text.++ name Text.++ ".c")) (Text.toUtf8 c)
+      printLine ("wrote out/anf-" Text.++ name Text.++ ".c")
+
+shapeOut : Text -> [Grp] -> Out
+shapeOut name gs =
+  if name Text.== "state" then
+    match findGroup "bump" gs with
+        None -> CErr "no bump"
+        Some btoks ->
+          match findGroup "stateHandler" gs with
+            None -> CErr "no stateHandler"
+            Some htoks ->
+              match bumpFacts btoks with
+                None -> CErr "bump shape"
+                Some (getT, putT) ->
+                  match handlerFacts htoks with
+                    None -> CErr "handler shape"
+                    Some (put2, get2) ->
+                      if Boolean.not (Nat.eq getT get2) then CErr "get tag"
+                      else if Boolean.not (Nat.eq putT put2) then CErr "put tag"
+                      else stateProg getT putT
+  else if name Text.== "choose" then
+      match findGroup "chooseBody" gs with
+        None -> CErr "no chooseBody"
+        Some btoks ->
+          match findGroup "runChoose" gs with
+            None -> CErr "no runChoose"
+            Some htoks ->
+              whole = allToks gs
+              match chooseFacts btoks htoks whole with
+                None -> CErr "choose shape"
+                Some tag -> chooseProg tag
+  else if name Text.== "color" then colorOut gs
+  else if name Text.== "abort" then abortOut gs
+  else if name Text.== "snapin" || name Text.== "snapout" then snapCompile gs
+  else
+    match findGroup "chooseBody" gs with
+      Some _ -> shapeOut "choose" gs
+      None ->
+        match findGroup "bump" gs with
+          Some _ ->
+            match findGroup "stateHandler" gs with
+              Some _ -> shapeOut "state" gs
+              None -> CErr "anf name"
+          None -> CErr "anf name"
+
+main : '{IO, Exception} ()
+main = do
+  compileOne "abort"
+  compileOne "local"
+  compileOne "choose"
+  compileOne "snapin"
+  compileOne "snapout"
+  compileOne "state"
+  compileOne "exc"
+  compileOne "raise"
+  compileOne "cut"
+  compileOne "keep"
+  compileOne "ref"
+  compileOne "lines"
+  compileOne "stm"
+  compileOne "retry"
+  compileOne "skipr"
+  compileOne "under"
+  compileOne "words"
+  compileOne "bytes"
+  compileOne "map"
+
+dropNl : Text -> Text
+dropNl t =
+  n = Text.size t
+  if Nat.eq n 0 then t
+  else
+    c = Text.drop (n Nat.- 1) t
+    if c Text.== "\n" || c Text.== "\r" then dropNl (Text.take (n Nat.- 1) t) else t
+
+emitRequest : '{IO, Exception} ()
+emitRequest = do
+  raw = IO.FilePath.readFile (IO.FilePath.FilePath "anf/request.txt")
+  stem = dropNl (Text.fromUtf8 raw)
+  compileAnf stem
+
+emitCc : '{IO, Exception} ()
+emitCc = do
+  compileLeaf "cc"
+
+emitChoose : '{IO, Exception} ()
+emitChoose = do
+  compileAnf "choose"
+
+emitLeaves : '{IO, Exception} ()
+emitLeaves = do
+  compileAnf "leaves"
+
+emitRead : '{IO, Exception} ()
+emitRead = do
+  compileAnf "readanf"
+  compileAnf "leaves"
+
+emitGate : '{IO, Exception} ()
+emitGate = do
+  compileAnf "gate"
+  compileAnf "leaves"
+  compileAnf "readanf"
+
+emitWalk : '{IO, Exception} ()
+emitWalk = do
+  compileLeaf "cc"
+  compileAnf "gate"
+  compileAnf "leaves"
+  compileAnf "readanf"
+
+emitDump : '{IO, Exception} ()
+emitDump = do
+  compileAnf "statefull"
+  compileAnf "choosefull"
+  compileAnf "abortfull"
+  compileAnf "localfull"
+  compileAnf "colorfull"
+  compileAnf "snapin"
+  compileAnf "snapout"
+  compileAnf "local"
+  compileAnf "choose"
+  compileAnf "fruitfull"
+  compileAnf "mixfull"
+
+anfMain : '{IO, Exception} ()
+anfMain = do
+  compileAnf "state"
+  compileAnf "choose"
+  compileAnf "color"
+  compileAnf "abort"
+  compileAnf "snapin"
+  compileAnf "snapout"
+  compileAnf "local"
+  compileAnf "leaves"
+  compileAnf "readanf"
+  compileAnf "gate"

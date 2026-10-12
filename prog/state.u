@@ -1,0 +1,25 @@
+use lib.unison_base_7_20_0
+
+structural ability State s where
+  get : {State s} s
+  put : s ->{State s} ()
+
+stateHandler : Nat -> Request {State Nat} Nat -> (Nat, Nat)
+stateHandler s = cases
+  { State.get -> k } -> handle k s with stateHandler s
+  { State.put s2 -> k } -> handle k () with stateHandler s2
+  { a } -> (s, a)
+
+bump : Nat ->{State Nat} Nat
+bump i =
+  if Nat.eq i 0 then State.get
+  else
+    cur = State.get
+    State.put (cur Nat.+ i)
+    bump (i Nat.- 1)
+
+main : '{IO, Exception} ()
+main = do
+  (st, value) = handle bump 100000 with stateHandler 0
+  printLine (Nat.toText st)
+  printLine (Nat.toText value)

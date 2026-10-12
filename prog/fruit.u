@@ -1,0 +1,17 @@
+use lib.unison_base_7_20_0
+
+structural ability Fruit where
+  pick : {Fruit} Nat
+
+runFruit : Request {Fruit} Nat -> Nat
+runFruit = cases
+  { Fruit.pick -> k } -> handle k 9 with runFruit
+  { n } -> n
+
+main : '{IO, Exception} ()
+main = do
+  n = handle
+    x = Fruit.pick
+    x Nat.+ 1
+  with runFruit
+  printLine (Nat.toText n)

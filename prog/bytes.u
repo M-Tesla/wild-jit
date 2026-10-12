@@ -1,0 +1,9 @@
+use lib.unison_base_7_20_0
+
+main : '{IO, Exception} ()
+main = do
+  b = Bytes.fromList [65, 66]
+  c = b Bytes.++ Bytes.fromList [67]
+  printLine (Nat.toText (Bytes.size c))
+  printLine (Nat.toText (Optional.getOrElse 0 (Bytes.at 0 c)))
+  printLine (Nat.toText (Optional.getOrElse 0 (Bytes.at 2 c)))

@@ -1,0 +1,7 @@
+use lib.unison_base_7_20_0
+
+hiMain : '{IO, Exception} ()
+hiMain = do
+  n = handle !chooseBody with runChoose
+  printLine "hi"
+  printLine (Nat.toText n)

@@ -1,0 +1,8 @@
+use lib.unison_base_7_20_0
+
+readAnf : '{IO, Exception} ()
+readAnf = do
+  raw = IO.FilePath.readFile (IO.FilePath.FilePath "anf/choose.anf")
+  text = Text.fromUtf8 raw
+  IO.FilePath.writeFile (IO.FilePath.FilePath "out/choose-copy.anf") raw
+  printLine (Nat.toText (Text.size text))

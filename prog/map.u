@@ -1,0 +1,10 @@
+use lib.unison_base_7_20_0
+
+main : '{IO, Exception} ()
+main = do
+  m = Map.insert 1 7 Map.empty
+  m2 = Map.insert 2 9 m
+  printLine (Nat.toText (Map.size m2))
+  printLine (Nat.toText (Optional.getOrElse 0 (Map.lookup 2 m2)))
+  printLine (Nat.toText (Optional.getOrElse 0 (Map.lookup 1 m2)))
+  printLine (Nat.toText (Optional.getOrElse 0 (Map.lookup 3 m2)))

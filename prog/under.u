@@ -1,0 +1,28 @@
+use lib.unison_base_7_20_0
+
+structural ability Ask where
+  ask : {Ask} Nat
+
+structural ability Tick where
+  tick : {Tick} Nat
+
+runTick : Nat -> Request {Tick} Nat -> Nat
+runTick n = cases
+  { Tick.tick -> k } -> handle k (n Nat.+ 1) with runTick (n Nat.+ 1)
+  { a } -> a
+
+runAsk : Request {Ask} Nat -> Nat
+runAsk = cases
+  { Ask.ask -> k } -> handle (k 10) with runTick 40
+  { a } -> a
+
+main : '{IO, Exception} ()
+main = do
+  n = handle
+    handle
+      x = Ask.ask
+      y = Tick.tick
+      x Nat.+ y
+    with runAsk
+  with runTick 0
+  printLine (Nat.toText n)

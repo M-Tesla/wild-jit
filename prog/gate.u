@@ -1,0 +1,19 @@
+use lib.unison_base_7_20_0
+
+structural type Gate = GOut Text | GErr Text
+
+pick : Gate -> Text
+pick o =
+  match o with
+    GOut t -> t
+    GErr e ->
+      match e with
+        "not ask" -> "ask"
+        _ -> e
+
+showGate : '{IO, Exception} ()
+showGate = do
+  printLine (pick (GErr "not ask"))
+  printLine (pick (GErr "nope"))
+  printLine (pick (GOut "ok"))
+  printLine (Text.fromUtf8 (Text.toUtf8 "ab"))

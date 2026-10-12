@@ -1,0 +1,29 @@
+use lib.unison_base_7_20_0
+
+structural ability State s where
+  get : {State s} s
+  put : s ->{State s} ()
+
+stateHandler : Nat -> Request {State Nat} Nat -> Nat
+stateHandler s = cases
+  { State.get -> k } -> handle k s with stateHandler s
+  { State.put s2 -> k } -> handle k () with stateHandler s2
+  { a } -> a
+
+runExc : Request {Exception} Nat -> Nat
+runExc = cases
+  { Exception.raise _ -> k } -> 0
+  { n } -> n
+
+main : '{IO, Exception} ()
+main = do
+  n = handle
+    handle
+      printLine (Nat.toText 7)
+      State.put 9
+      Exception.raise (failure "boom" ())
+      printLine (Nat.toText 8)
+      State.get
+    with stateHandler 0
+  with runExc
+  printLine (Nat.toText n)
